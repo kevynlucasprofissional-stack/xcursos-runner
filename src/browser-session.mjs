@@ -2,9 +2,22 @@ import { DEFAULT_LIMITS } from './constants.mjs';
 import { BrowserAutomationError } from './errors.mjs';
 import { assertLocalCdpEndpoint } from './chrome-launcher.mjs';
 
+const ACTIVE_CONTEXTS=new Set();
 function contextClosed(context){try{return context?.isClosed?.()===true;}catch{return false;}}
 function browserConnected(browser){try{return browser?.isConnected?.()!==false;}catch{return false;}}
 export function isTargetClosedError(error){return /(?:Target page, context or browser has been closed|target.*closed|page.*closed|browser.*closed|browser has been disconnected|connection closed|session closed)/i.test(String(error?.message||error||''));}
+
+export async function findConnectedPageByUrl(url=''){
+  const target=String(url||'');if(!target)return null;
+  for(const context of [...ACTIVE_CONTEXTS]){
+    if(contextClosed(context)){ACTIVE_CONTEXTS.delete(context);continue;}
+    let pages=[];try{pages=context.pages?.()||[];}catch{continue;}
+    for(const page of pages){
+      try{if(page?.isClosed?.()!==true&&page.url?.()===target)return page;}catch{}
+    }
+  }
+  return null;
+}
 
 export class BrowserSession {
   constructor({cdpEndpoint='http://127.0.0.1:9222',logger=null,limits={},playwrightLoader=null,runtimeStats=null}={}){
@@ -16,7 +29,7 @@ export class BrowserSession {
     this.capabilities={engine:'playwright-cdp',persistentProfile:true,externalChrome:true,mcp:false,cdpEndpoint:this.cdpEndpoint};
   }
 
-  invalidate(){this.browser=null;this.context=null;this.connected=false;}
+  invalidate(){if(this.context)ACTIVE_CONTEXTS.delete(this.context);this.browser=null;this.context=null;this.connected=false;}
   isConnected(){return Boolean(this.connected&&this.context&&!contextClosed(this.context)&&browserConnected(this.browser));}
 
   async connect({force=false}={}){
@@ -30,7 +43,7 @@ export class BrowserSession {
       const browser=await this.chromium.connectOverCDP(this.cdpEndpoint,{timeout:this.limits.browserLaunchTimeoutMs,isLocal:true,noDefaults:true});
       const context=browser.contexts?.()[0]||null;
       if(!context)throw new Error('Chrome não expôs o contexto padrão via CDP.');
-      this.browser=browser;this.context=context;this.connected=true;
+      this.browser=browser;this.context=context;this.connected=true;ACTIVE_CONTEXTS.add(context);
       browser.on?.('disconnected',()=>{if(this.browser===browser)this.invalidate();});
       context.setDefaultTimeout?.(this.limits.inspectTimeoutMs);
       context.setDefaultNavigationTimeout?.(this.limits.navigationTimeoutMs);
