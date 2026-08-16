@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
-import { FILE_BACKED_STATUSES, RETRYABLE_FAILURE_STATUSES, TERMINAL_STATUSES } from './constants.mjs';
+import { FILE_BACKED_STATUSES, LESSON_SKIP_POLICIES, RETRYABLE_FAILURE_STATUSES, TERMINAL_STATUSES } from './constants.mjs';
 import { RunnerError } from './errors.mjs';
 import { atomicWriteJson, nowIso, readJsonIfExists, safePersistUrl, sanitizeForPersistence, sanitizeSegment } from './utils.mjs';
 
@@ -17,7 +17,14 @@ function inside(parent, child){
   const rel=path.relative(parent,child);
   return rel==='' || (!rel.startsWith('..') && !path.isAbsolute(rel));
 }
-
+function expandSkipPolicyPositions(policy,total){
+  const out=[];
+  for(const range of Array.isArray(policy?.ranges)?policy.ranges:[]){
+    const start=Math.max(1,Number(range?.start)||0);const end=Math.min(Number(total)||0,Number(range?.end)||0);
+    for(let p=start;p<=end;p++)out.push(p);
+  }
+  return [...new Set(out)].sort((a,b)=>a-b);
+}
 
 async function rewriteJsonlAtomic(filePath, records){
   await fs.mkdir(path.dirname(filePath),{recursive:true});
@@ -74,8 +81,8 @@ export function indexManifest(records, total = null) {
 export function summarizeAudit({ total, manifestRecords, invalidFilePositions = [] }) {
   const {map,duplicates,invalid}=indexManifest(manifestRecords,total);
   const missing=[]; for(let i=1;i<=total;i++)if(!map.has(i))missing.push(i);
-  const counts={downloaded:0,alreadyPresent:0,noVideo:0,drmProtected:0,downloadFailed:0,verifyFailed:0,mediaNotFound:0};
-  const key={DOWNLOADED:'downloaded',ALREADY_PRESENT:'alreadyPresent',NO_VIDEO:'noVideo',DRM_PROTECTED:'drmProtected',DOWNLOAD_FAILED:'downloadFailed',VERIFY_FAILED:'verifyFailed',MEDIA_NOT_FOUND:'mediaNotFound'};
+  const counts={downloaded:0,alreadyPresent:0,noVideo:0,drmProtected:0,skipped:0,downloadFailed:0,verifyFailed:0,mediaNotFound:0};
+  const key={DOWNLOADED:'downloaded',ALREADY_PRESENT:'alreadyPresent',NO_VIDEO:'noVideo',DRM_PROTECTED:'drmProtected',SKIPPED:'skipped',DOWNLOAD_FAILED:'downloadFailed',VERIFY_FAILED:'verifyFailed',MEDIA_NOT_FOUND:'mediaNotFound'};
   for(const rec of map.values())if(key[rec.status])counts[key[rec.status]]++;
   return {
     total,
@@ -221,6 +228,27 @@ export class StateStore {
     return positions.sort((a,b)=>a-b);
   }
 
+  matchingSkipPolicies(){
+    return LESSON_SKIP_POLICIES.filter(policy=>sameCourseName(policy?.courseName,this.courseName) && (!policy?.totalPositions || Number(policy.totalPositions)===Number(this.totalPositions)));
+  }
+
+  async applyConfiguredSkips(){
+    const policies=this.matchingSkipPolicies();if(!policies.length)return[];
+    const present=new Set(this.manifestRecords.map(rec=>Number(rec?.position)).filter(Number.isInteger));const inserted=[];
+    for(const policy of policies){
+      for(const position of expandSkipPolicyPositions(policy,this.totalPositions)){
+        if(present.has(position))continue;
+        const record=sanitizeForPersistence({
+          position,courseName:this.courseName,lessonTitle:'Ignorado por política',moduleName:null,modulePath:[],lessonUrl:null,status:'SKIPPED',outputFile:null,attempts:0,
+          validation:{skipPolicyId:policy.id||null,skipReason:policy.reason||'CONFIGURED_SKIP',skipLabel:policy.label||null},timestamp:nowIso(),
+        });
+        await appendJsonlDurable(this.manifestPath,record);this.manifestRecords.push(record);present.add(position);inserted.push(position);
+      }
+    }
+    if(inserted.length)await this.logger?.log?.('SKIP','Configured lesson positions marked SKIPPED',{course:this.courseName,positions:inserted});
+    return inserted;
+  }
+
   async initialize({ resume=true, workPageUrl=null }={}) {
     await fs.mkdir(this.metaDir,{recursive:true});
     await this.ensureCourseIdentity();
@@ -228,6 +256,7 @@ export class StateStore {
     this.manifestRecords=await readJsonl(this.manifestPath,{repairTrailingPartial:true});
     this.validateManifestCourse();
     if(resume)await this.reopenRetryableFailures();
+    await this.applyConfiguredSkips();
     const indexed=indexManifest(this.manifestRecords,this.totalPositions);
     if(indexed.duplicates.length)throw new RunnerError(`Manifesto contém posições duplicadas: ${indexed.duplicates.join(', ')}`,{code:'MANIFEST_DUPLICATES'});
     if(indexed.invalid.length)throw new RunnerError('Manifesto contém posições inválidas.',{code:'MANIFEST_INVALID_POSITION'});
