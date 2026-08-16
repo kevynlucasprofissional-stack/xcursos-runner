@@ -29,6 +29,12 @@ function failureSummary(records=[]){
   for(const rec of records){const code=rec?.failureCode||rec?.status||'UNKNOWN';let entry=map.get(code);if(!entry){entry={code,count:0,positions:[]};map.set(code,entry);}entry.count++;entry.positions.push(rec.position);}
   return [...map.values()].map(x=>({...x,positions:x.positions.sort((a,b)=>a-b)})).sort((a,b)=>String(a.code).localeCompare(String(b.code)));
 }
+function retryDelayText(ms){const n=Math.max(0,Number(ms)||0);if(n<1000)return`${Math.round(n)}ms`;const seconds=n/1000;return`${Number.isInteger(seconds)?seconds:seconds.toFixed(1)}s`;}
+function shortRetryDetail(value=''){const text=String(value||'').replace(/\s+/g,' ').trim();return text?text.slice(0,140):null;}
+export function formatRetryProgress({position,total,causeCode='UNKNOWN',detail=null,attempt=1,maxAttempts=1,delayMs=0,retry=true}={}){
+  const base=`[RETRY] ${position}/${total} | ${causeCode}${detail?` | ${detail}`:''} | tentativa ${attempt}/${maxAttempts}`;
+  return retry?`${base} | retry em ${retryDelayText(delayMs)}`:`${base} | orçamento esgotado`;
+}
 
 export class XCursosCourseRunner {
   constructor({ profileDir=null, cdpEndpoint='http://127.0.0.1:9222', startUrl=null, headless=false, outputRoot=null, browser=null, browserSession=null, pageController=null, downloader=null, logger=null, limits={}, playwrightLoader=null, retryPolicy=null, schedulerFactory=null, sleepFn=sleep, runtimeStats=null, autoThrottle=null, shutdownController=null, progressSink=null, enableSignalHandlers=false, debugSnapshots=null }={}) {
@@ -150,6 +156,17 @@ export class XCursosCourseRunner {
     await this.logger.log('REPOSITION',message,data||undefined);
     const suffix=data?` ${Object.entries(data).filter(([,v])=>v!=null).map(([k,v])=>`${k}=${typeof v==='object'?JSON.stringify(v):v}`).join(' ')}`:'';
     this.progressSink?.(`[REPOSITION] ${message}${suffix}`);
+  }
+
+  async reportRetry({position,decision,code=null,status=null,failureCode=null,networkCode=null,message=null}={}){
+    const causeCode=String(failureCode||code||status||'UNKNOWN');
+    let detail=networkCode||null;
+    if(!detail&&message){const short=shortRetryDetail(message);if(short&&!short.toUpperCase().includes(causeCode.toUpperCase()))detail=short;}
+    const line=formatRetryProgress({position,total:this.total,causeCode,detail,attempt:decision.attempt,maxAttempts:decision.maxAttempts,delayMs:decision.delayMs,retry:decision.retry});
+    const data={position,total:this.total,causeCode,status:status||null,failureCode:failureCode||null,networkCode:networkCode||null,attempt:decision.attempt,maxAttempts:decision.maxAttempts,delayMs:decision.delayMs,classification:decision.classification,retry:decision.retry};
+    await this.logger.log('RETRY',line.replace(/^\[RETRY\]\s*/,''),data);
+    this.progressSink?.(line);
+    return{line,data};
   }
 
   repositionDiagnostics({currentPosition=null,targetPosition,strategiesTried=[],exactTargetUrl=null,checkpoint=null,courseAnchor=null}={}){
@@ -468,12 +485,13 @@ export class XCursosCourseRunner {
           retryableFailureMap.set(position,{position,status:processed.status,...(processed.failureCode?{failureCode:processed.failureCode}:{})});this.runtimeStats.recordFailure();this.autoThrottle.recordFailure({status:processed.status==='DOWNLOAD_FAILED'?500:null});
           if(decision.retry){
             this.runtimeStats.recordRetry();
-            this.scheduler.requeue(position,{delayMs:decision.delayMs,priorityPenalty:decision.priorityPenalty,lastError:{code:processed.status},lessonUrl});
-            await this.logger.log('RETRY',`requeue position ${position}`,{attempt:task.attempts,delayMs:decision.delayMs,priority:this.scheduler.get(position)?.priority});
+            const retryCause=processed.failureCode||processed.status;
+            this.scheduler.requeue(position,{delayMs:decision.delayMs,priorityPenalty:decision.priorityPenalty,lastError:{code:retryCause,status:processed.status,failureCode:processed.failureCode||null},lessonUrl});
+            await this.reportRetry({position,decision,code:processed.status,status:processed.status,failureCode:processed.failureCode||null});
           }else{
             this.scheduler.markBlocked(position,{lastError:{code:processed.status,failureCode:processed.failureCode||null},lessonUrl});blocked.push({position,status:processed.status,...(processed.failureCode?{failureCode:processed.failureCode}:{})});
             await this.debugSnapshots?.capture?.({position,pageRef:this.workPage,error:Object.assign(new Error(processed.status),{code:processed.status}),metadata:{courseName:this.courseName,total:this.total,attempts:task.attempts,mediaDiagnostics:this.browser.mediaDiagnostics?.(this.workPage)||null},networkEvents:this.browser.networkSnapshot?.(this.workPage)||[]});
-            await this.logger.log('RETRY',`retry budget exhausted for position ${position}`,{attempts:task.attempts,status:processed.status});
+            await this.reportRetry({position,decision,code:processed.status,status:processed.status,failureCode:processed.failureCode||null});
           }
         }else{
           retryableFailureMap.delete(position);
@@ -490,13 +508,14 @@ export class XCursosCourseRunner {
         if(decision.retry){
           this.runtimeStats.recordFailure();this.runtimeStats.recordRetry();this.autoThrottle.recordFailure({status:error?.status||null});
           this.scheduler.requeue(position,{delayMs:decision.delayMs,priorityPenalty:decision.priorityPenalty,lastError:safeError(error),lessonUrl});
-          await this.state.appendError({scope:'SCHED',position,status:'RETRY_LATER',message:String(error?.message||error),code:error?.code||null});
-          await this.logger.log('RETRY',`transient error requeued at position ${position}`,{code:error?.code||null,attempt:task.attempts,delayMs:decision.delayMs});
+          const networkCode=error?.details?.networkCode||null;
+          await this.state.appendError({scope:'SCHED',position,status:'RETRY_LATER',message:String(error?.message||error),code:error?.code||null,networkCode,attempt:decision.attempt,maxAttempts:decision.maxAttempts,delayMs:decision.delayMs});
+          await this.reportRetry({position,decision,code:error?.code||null,networkCode,message:error?.message||null});
           previousPosition=null;
         }else{
           this.scheduler.markBlocked(position,{lastError:safeError(error),lessonUrl});
           await this.schedulerCheckpoint.save(this.scheduler.snapshot());
-          await this.state.appendError({scope:'SCHED',position,status:'BLOCKED',message:String(error?.message||error),code:error?.code||null});
+          await this.state.appendError({scope:'SCHED',position,status:'BLOCKED',message:String(error?.message||error),code:error?.code||null,networkCode:error?.details?.networkCode||null,attempt:decision.attempt,maxAttempts:decision.maxAttempts});
           throw error;
         }
       }
@@ -561,7 +580,7 @@ export async function downloadCurrentLesson(options={}){const r=new XCursosCours
 export async function downloadRange(options={}){const r=new XCursosCourseRunner(options);try{return await r.runRange({start:options.start,end:options.end,resume:options.resume??true,finalAudit:false});}finally{await r.dispose({cleanupPages:true});}}
 export async function downloadCourse(options={}){
   const r=new XCursosCourseRunner(options);
-  try{return await r.runCourse({resume:options.resume??true});}
+  try{return await r.runCourse({resume:options.resume??true});
   catch(error){
     let audit=null;
     try{
