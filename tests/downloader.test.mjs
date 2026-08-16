@@ -39,3 +39,39 @@ test('V4.2.4 RED: yt-dlp connection reset is classified separately from generic 
   const r=await d.download({mediaUrl:'https://cdn/a.mp4',refererUrl:'https://xc/a',paths:{moduleDir:root,baseName:'001 - A',template:path.join(root,'001 - A.%(ext)s')}});
   assert.equal(r.ok,false);assert.equal(r.failureCode,'NETWORK_RESET');
 });
+
+test('native transport captures browser download, validates .part and promotes to deterministic final path',async()=>{
+  const root=await tmp();const referer='https://www.xcursos.com/curso/c/aula/7';
+  const locator={async count(){return 1;},async getAttribute(){return '/api/video/download?lessonId=lesson-7';},async click(){}};
+  const download={failure:async()=>null,suggestedFilename:()=> 'original-name.mp4',async saveAs(file){await fs.writeFile(file,'native-video');}};
+  const page={isClosed:()=>false,locator:()=>({first:()=>locator}),waitForEvent:async(name)=>{assert.equal(name,'download');return download;}};
+  let ytCalls=0;const runner=async(command)=>{if(command==='yt'){ytCalls++;throw new Error('yt-dlp must not run');}return{code:0,stdout:JSON.stringify({streams:[{codec_type:'video',codec_name:'h264'}],format:{duration:'42'}}),stderr:''};};
+  const d=new MediaDownloader({ytDlpPath:'yt',ffprobePath:'ff',processRunner:runner,pageResolver:async url=>{assert.equal(url,referer);return page;}});
+  const paths={moduleDir:root,baseName:'007 - Aula',template:path.join(root,'007 - Aula.%(ext)s')};
+  const r=await d.tryNativeDownload({refererUrl:referer,paths});
+  assert.equal(r.ok,true);assert.equal(r.attempted,true);assert.equal(r.downloadMethod,'XCURSOS_NATIVE');assert.equal(path.basename(r.finalPath),'007 - Aula.mp4');assert.equal(ytCalls,0);
+  const validation=await d.validateVideo(r.finalPath);assert.equal(validation.downloadMethod,'XCURSOS_NATIVE');
+  const names=await fs.readdir(root);assert.equal(names.some(x=>x.endsWith('.part')),false);
+});
+
+test('native transport refuses materials and untrusted video download lookalikes without clicking',async()=>{
+  const root=await tmp();let clicked=false;
+  for(const href of ['/api/materials/download?lessonId=x&index=0','https://evil.example/api/video/download?lessonId=x']){
+    const locator={async count(){return 1;},async getAttribute(){return href;},async click(){clicked=true;}};
+    const page={isClosed:()=>false,locator:()=>({first:()=>locator}),waitForEvent:async()=>{throw new Error('must not wait');}};
+    const d=new MediaDownloader({ytDlpPath:'yt',ffprobePath:'ff',pageResolver:async()=>page});
+    const r=await d.tryNativeDownload({refererUrl:'https://www.xcursos.com/curso/c/aula/1',paths:{moduleDir:root,baseName:'001 - A',template:path.join(root,'001 - A.%(ext)s')}});
+    assert.equal(r.ok,false);assert.equal(r.attempted,false);
+  }
+  assert.equal(clicked,false);
+});
+
+test('native transport quarantines invalid browser file and reports verification failure',async()=>{
+  const root=await tmp();const locator={async count(){return 1;},async getAttribute(){return '/api/video/download?lessonId=x';},async click(){}};
+  const download={failure:async()=>null,suggestedFilename:()=> 'x.mp4',async saveAs(file){await fs.writeFile(file,'bad');}};
+  const page={isClosed:()=>false,locator:()=>({first:()=>locator}),waitForEvent:async()=>download};
+  const d=new MediaDownloader({ytDlpPath:'yt',ffprobePath:'ff',pageResolver:async()=>page,processRunner:async()=>({code:0,stdout:JSON.stringify({streams:[],format:{duration:'0'}}),stderr:''})});
+  const r=await d.tryNativeDownload({refererUrl:'https://www.xcursos.com/curso/c/aula/1',paths:{moduleDir:root,baseName:'001 - A',template:path.join(root,'001 - A.%(ext)s')}});
+  assert.equal(r.ok,false);assert.equal(r.attempted,true);assert.equal(r.failureCode,'VERIFY_NO_VIDEO_STREAM');assert.ok(r.quarantine);
+  const names=await fs.readdir(root);assert.ok(names.some(x=>x.includes('.corrupt-')));assert.equal(names.some(x=>x==='001 - A.mp4'),false);
+});
