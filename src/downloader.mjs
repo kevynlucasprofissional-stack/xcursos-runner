@@ -84,16 +84,18 @@ function isExpectedNativeUrl(actual='',expected=''){
   const expectedId=nativeLessonId(expected);if(!expectedId)return false;
   const normalized=normalizeNativeDownloadUrl(actual,expected);return Boolean(normalized&&nativeLessonId(normalized)===expectedId);
 }
-function delayReject(ms,error,signal=null){
-  return new Promise((_,reject)=>{
-    const timer=setTimeout(()=>{cleanup();reject(error);},Math.max(1,Number(ms)||1));
-    const onAbort=()=>{cleanup();reject(new RunnerError('Download abortado.',{code:'PROCESS_ABORTED'}));};
+async function withTimeout(promise,ms,error,signal=null){
+  return await new Promise((resolve,reject)=>{
+    let settled=false;
     const cleanup=()=>{clearTimeout(timer);signal?.removeEventListener?.('abort',onAbort);};
+    const finish=(fn,value)=>{if(settled)return;settled=true;cleanup();fn(value);};
+    const onAbort=()=>finish(reject,new RunnerError('Download abortado.',{code:'PROCESS_ABORTED'}));
+    const timer=setTimeout(()=>finish(reject,error),Math.max(1,Number(ms)||1));
     if(signal?.aborted)return onAbort();
     signal?.addEventListener?.('abort',onAbort,{once:true});
+    Promise.resolve(promise).then(value=>finish(resolve,value),cause=>finish(reject,cause));
   });
 }
-async function withTimeout(promise,ms,error,signal=null){return await Promise.race([promise,delayReject(ms,error,signal)]);}
 async function waitForFile(filePath,{timeoutMs=5000,signal=null}={}){
   const end=Date.now()+Math.max(1,Number(timeoutMs)||1);
   while(Date.now()<=end){
@@ -274,8 +276,6 @@ export class MediaDownloader {
                 return{mode:'CDP',path:file,guid:event.guid,suggestedFilename:event.suggestedFilename||started.suggestedFilename||''};
               });
               const playwrightCompletion=playwrightDownloadPromise.then(async result=>{
-                // Playwright é apenas uma confirmação alternativa de sucesso. Falha desse
-                // observador não pode cancelar um download que o CDP ainda acompanha.
                 if(!result.ok)return await new Promise(()=>{});download=result.value;
                 let browserFailure=null;try{browserFailure=await download.failure();}catch{return await new Promise(()=>{});}
                 if(browserFailure)return await new Promise(()=>{});
@@ -285,17 +285,20 @@ export class MediaDownloader {
                   return{mode:'PLAYWRIGHT_PATH',path:file,guid,suggestedFilename:download.suggestedFilename?.()||suggestedFilename};
                 }catch{return await new Promise(()=>{});}
               });
-              // race (não Promise.any): cancelamento/erro CDP deve vencer imediatamente e nunca
-              // ser mascarado por um caminho parcial que o Playwright eventualmente exponha.
-              const completed=await Promise.race([cdpCompletion,playwrightCompletion]);
+              let completed=await Promise.race([cdpCompletion,playwrightCompletion]);
+              if(completed?.mode==='PLAYWRIGHT_PATH'){
+                try{
+                  completed=await withTimeout(cdpCompletion,Math.min(1000,Math.max(100,this.limits.nativeDownloadEventTimeoutMs)),new RunnerError('Evento final CDP não chegou após o Playwright concluir.',{code:'NATIVE_CDP_COMPLETION_EVENT_MISSING'}),signal);
+                }catch(error){
+                  if(error?.code!=='NATIVE_CDP_COMPLETION_EVENT_MISSING')throw error;
+                }
+              }
               sourcePath=completed.path;guid=completed.guid||guid;suggestedFilename=completed.suggestedFilename||suggestedFilename;completionMode=completed.mode;
             }catch(error){
               if(tracker.guid&&cdp)await cdp.send('Browser.cancelDownload',{guid:tracker.guid}).catch(()=>{});
               return{attempted:true,ok:false,failureCode:error?.code||'NATIVE_DOWNLOAD_FAILED',diagnosticTail:diagnosticTail(error?.message||error),error};
             }
           }else{
-            // Browser.downloadWillBegin não chegou. A política CDP já foi aplicada, mas o
-            // Playwright ainda pode provar a conclusão por download.path() sem cópia.
             const result=await playwrightDownloadPromise;
             if(!result.ok)return{attempted:true,ok:false,failureCode:startError?.code||'NATIVE_DOWNLOAD_EVENT_FAILED',diagnosticTail:diagnosticTail(startError?.message||result.error?.message||result.error),error:startError||result.error};
             download=result.value;
@@ -339,7 +342,12 @@ export class MediaDownloader {
         if(/\.crdownload$/i.test(stagedPath))return{attempted:true,ok:false,failureCode:'NATIVE_DOWNLOAD_INCOMPLETE',diagnosticTail:'Arquivo .crdownload não pode ser promovido.'};
         let validation;
         try{validation=await this.validateVideo(stagedPath,{signal});}
-        catch(error){return{attempted:true,ok:false,failureCode:error?.code||'NATIVE_VERIFY_FAILED',diagnosticTail:diagnosticTail(error?.message||error),error};}
+        catch(error){
+          const stagedKey=methodKey(stagedPath);this.validationCacheByPath.delete(stagedKey);this.downloadMethodByPath.delete(stagedKey);
+          let quarantine=null;
+          try{quarantine=path.join(paths.moduleDir,`${paths.baseName}${ext}.corrupt-${Date.now()}`);await fs.rename(stagedPath,quarantine);}catch{quarantine=null;}
+          return{attempted:true,ok:false,failureCode:error?.code||'NATIVE_VERIFY_FAILED',diagnosticTail:diagnosticTail(error?.message||error),quarantine,error};
+        }
 
         const finalPath=path.join(paths.moduleDir,`${paths.baseName}${ext}`);
         try{
