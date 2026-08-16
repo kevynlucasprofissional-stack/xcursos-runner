@@ -9,7 +9,21 @@ import { NetworkMediaObserver, correlateMediaObjects } from './network-media-obs
 import { AdaptiveLocator } from './adaptive-locator.mjs';
 import { ActionabilityProbe, isPlaywrightTimeoutError } from './actionability-probe.mjs';
 
+const TRANSIENT_NAVIGATION_NETWORK_CODES=new Set([
+  'ERR_NETWORK_ACCESS_DENIED','ERR_NETWORK_CHANGED','ERR_INTERNET_DISCONNECTED','ERR_CONNECTION_RESET','ERR_CONNECTION_ABORTED','ERR_CONNECTION_CLOSED','ERR_CONNECTION_REFUSED','ERR_TIMED_OUT','ERR_NAME_NOT_RESOLVED','ERR_ADDRESS_UNREACHABLE','ERR_PROXY_CONNECTION_FAILED','ERR_TUNNEL_CONNECTION_FAILED','ERR_TEMPORARILY_THROTTLED','ERR_HTTP2_PROTOCOL_ERROR','ERR_QUIC_PROTOCOL_ERROR','ERR_SOCKET_NOT_CONNECTED',
+]);
+const PERMANENT_NAVIGATION_NETWORK_CODES=new Set([
+  'ERR_INVALID_URL','ERR_UNKNOWN_URL_SCHEME','ERR_DISALLOWED_URL_SCHEME','ERR_UNSAFE_PORT','ERR_BLOCKED_BY_CLIENT','ERR_BLOCKED_BY_ADMINISTRATOR',
+]);
+
 export function isLessonUrl(url=''){return LESSON_URL_RE.test(String(url));}
+export function navigationNetworkCode(error){return String(error?.message||error||'').match(/\bnet::(ERR_[A-Z0-9_]+)\b/i)?.[1]?.toUpperCase()||null;}
+export function classifyNavigationNetworkError(error){
+  const networkCode=navigationNetworkCode(error);if(!networkCode)return{networkCode:null,kind:null};
+  if(TRANSIENT_NAVIGATION_NETWORK_CODES.has(networkCode))return{networkCode,kind:'TRANSIENT'};
+  if(PERMANENT_NAVIGATION_NETWORK_CODES.has(networkCode)||/^ERR_(?:CERT|SSL)_/.test(networkCode))return{networkCode,kind:'PERMANENT'};
+  return{networkCode,kind:'UNKNOWN'};
+}
 function pageClosed(page){try{return page?.isClosed?.()===true;}catch{return false;}}
 
 export class PageRef {
@@ -64,7 +78,7 @@ export class PageController {
     page=await this.pinWorkingPage(page);const lesson=await this.inspectLesson(page);return{page,lesson,cloned:false};
   }
 
-  async recoverRef(ref,{url=null}={}){
+  async recoverRef(ref,{url=null,navigateIfMissing=true}={}){
     const stable=url||ref?.url||this.pinnedUrl||null;const targetId=this.pinnedTargetId||await this.session.getTargetId?.(ref?.handle);this.invalidateInspection(ref);this.mark(ref,'STALE');
     await this.logger?.log('PAGE','Recovering pinned work page',{url:stable,targetPinned:Boolean(targetId)});
     try{
@@ -75,7 +89,7 @@ export class PageController {
         if(exact)recovered=this.ref(exact);
       }
       if(!recovered&&stable){const matches=handles.filter(p=>{try{return p.url()===stable;}catch{return false;}});if(matches.length===1)recovered=this.ref(matches[0]);else if(matches.length>1)throw new BrowserAutomationError('Há múltiplas abas com a mesma aula e o target pinado não pôde ser recuperado.',{code:'PAGE_RECOVERY_AMBIGUOUS',details:{url:stable,matches:matches.length}});}
-      if(!recovered&&stable){const blank=handles.find(p=>{try{return p.url()==='about:blank';}catch{return false;}});recovered=this.ref(blank||await this.session.newPage());recovered=await this.navigateExact(recovered,stable);}
+      if(!recovered&&stable){const blank=handles.find(p=>{try{return p.url()==='about:blank';}catch{return false;}});recovered=this.ref(blank||await this.session.newPage());if(navigateIfMissing)recovered=await this.navigateExact(recovered,stable);}
       if(!recovered)throw new BrowserAutomationError('Nenhuma página de aula pôde ser recuperada.',{code:'PAGE_RECOVERY_FAILED'});
       recovered=await this.pinWorkingPage(recovered);this.mark(recovered,'HEALTHY');return recovered;
     }catch(error){this.mark(ref,'DEAD');throw error;}
@@ -84,15 +98,32 @@ export class PageController {
   async navigateExact(ref,url){
     if(!isLessonUrl(url))throw new BrowserAutomationError('Tentativa de navegar para URL que não é aula XCursos válida.',{code:'NAV_EXACT_INVALID_URL',details:{url}});
     if(!ref?.handle||pageClosed(ref.handle))ref=await this.recoverRef(ref,{url});
-    try{
-      ref=await this.pinWorkingPage(ref);this.invalidateInspection(ref);this.networkObserver?.beginGeneration?.(ref.handle,{reason:'navigate-exact',lessonUrl:url});
-      await ref.handle.goto(url,{waitUntil:'domcontentloaded',timeout:this.limits.navigationTimeoutMs});
-      await this.authObserver.assertLesson(ref.handle,{requestedUrl:url});
-      await this.waitForLessonShell(ref);ref._title=await ref.handle.title().catch(()=>ref._title);this.mark(ref,'HEALTHY');return ref;
-    }catch(error){
-      if(error?.code)throw error;
-      if(isTargetClosedError(error))return await this.recoverRef(ref,{url});
-      throw new BrowserAutomationError(`Falha ao navegar para aula: ${String(error?.message||error)}`,{code:'NAV_EXACT_FAILED',cause:error,details:{url}});
+    const maxNetworkRecoveryAttempts=Math.min(2,Math.max(1,Math.trunc(Number(this.limits.navigationRetries)||1)));let recoveryAttempts=0;
+    while(true){
+      try{
+        ref=await this.pinWorkingPage(ref);this.invalidateInspection(ref);this.networkObserver?.beginGeneration?.(ref.handle,{reason:'navigate-exact',lessonUrl:url});
+        await ref.handle.goto(url,{waitUntil:'domcontentloaded',timeout:this.limits.navigationTimeoutMs});
+        await this.authObserver.assertLesson(ref.handle,{requestedUrl:url});
+        await this.waitForLessonShell(ref);ref._title=await ref.handle.title().catch(()=>ref._title);this.mark(ref,'HEALTHY');return ref;
+      }catch(error){
+        if(error?.code)throw error;
+        if(isTargetClosedError(error))return await this.recoverRef(ref,{url});
+        const network=classifyNavigationNetworkError(error);
+        if(network.kind==='TRANSIENT'){
+          if(recoveryAttempts<maxNetworkRecoveryAttempts){
+            recoveryAttempts++;
+            await this.logger?.log('RECOVERY','Transient navigation network error; reconnecting CDP/page before retry',{networkCode:network.networkCode,recoveryAttempt:recoveryAttempts,maxRecoveryAttempts:maxNetworkRecoveryAttempts});
+            try{ref=await this.recoverRef(ref,{url:null,navigateIfMissing:false});}
+            catch(recoveryError){throw new BrowserAutomationError(`Falha transitória de navegação e recovery CDP falhou: ${network.networkCode}`,{code:'NAV_NETWORK_ERROR',cause:recoveryError,details:{url,networkCode:network.networkCode,recoveryAttempts,recoveryFailure:String(recoveryError?.code||recoveryError?.message||recoveryError)}});}
+            await sleep(Math.min(1000,250*(2**(recoveryAttempts-1))));
+            continue;
+          }
+          throw new BrowserAutomationError(`Falha transitória de navegação após recovery limitado: ${network.networkCode}`,{code:'NAV_NETWORK_ERROR',cause:error,details:{url,networkCode:network.networkCode,recoveryAttempts}});
+        }
+        if(network.kind==='PERMANENT')throw new BrowserAutomationError(`Falha de navegação não recuperável automaticamente: ${network.networkCode}`,{code:'NAV_NETWORK_PERMANENT',cause:error,details:{url,networkCode:network.networkCode}});
+        if(network.kind==='UNKNOWN')throw new BrowserAutomationError(`Falha de rede de navegação não classificada: ${network.networkCode}`,{code:'NAV_NETWORK_UNKNOWN',cause:error,details:{url,networkCode:network.networkCode}});
+        throw new BrowserAutomationError(`Falha ao navegar para aula: ${String(error?.message||error)}`,{code:'NAV_EXACT_FAILED',cause:error,details:{url}});
+      }
     }
   }
 
