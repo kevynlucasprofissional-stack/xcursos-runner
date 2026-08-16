@@ -171,6 +171,11 @@ export class MediaDownloader {
       await this.logger?.log('NATIVE_FALLBACK','Native lesson download failed; falling back to yt-dlp',nativeFailure);
     }
 
+    if(!/^https?:/i.test(String(mediaUrl||''))){
+      const failureCode=nativeFailure?.failureCode||'MEDIA_URL_UNAVAILABLE';
+      return{ok:false,kind:'FAILED',failureCode,diagnosticTail:nativeFailure?.diagnosticTail||'Nenhuma URL de mídia segura disponível para fallback yt-dlp.',...(nativeFailure?{nativeFailure}: {})};
+    }
+
     const resumeArg=cleanStart?'--no-continue':'--continue';
     const args=['--no-playlist',resumeArg,'--no-overwrites','--retries','3','--fragment-retries','3','--referer',refererUrl,'--print','after_move:filepath','-o',paths.template,mediaUrl];
     await this.logger?.log('DOWNLOAD','Starting yt-dlp fallback',{media:redactUrl(mediaUrl),output:paths.template,cleanStart:Boolean(cleanStart),nativeAttempted:Boolean(native.attempted)});
