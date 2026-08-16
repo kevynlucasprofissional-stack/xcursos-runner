@@ -13,7 +13,23 @@ test('source[src] and HTML entities',()=>{const h='<h2>Course</h2><h1>A</h1><spa
 
 test('HLS, DASH and iframe fallbacks',()=>{assert.equal(parseXcursosLessonHtml('<h2>C</h2><h1>A</h1>1/2<video src="x.m3u8"></video>').mediaType,'HLS');assert.equal(parseXcursosLessonHtml('<h2>C</h2><h1>A</h1>1/2<source src="x.mpd">').mediaType,'DASH');assert.equal(parseXcursosLessonHtml('<h2>C</h2><h1>A</h1>1/2<iframe src="https://vimeo.com/1"></iframe>').mediaType,'EXTERNAL_IFRAME');});
 
-test('materials are never media',()=>{const r=parseXcursosLessonHtml('<h2>C</h2><h1>A</h1><span>1/2</span><a href="/api/materials/download?lessonId=x">PDF</a>');assert.equal(r.videoUrl,null);assert.equal(r.mediaType,'NONE');assert.equal(r.hasMaterialsLinks,true);});
+test('materials are never media',()=>{const r=parseXcursosLessonHtml('<h2>C</h2><h1>A</h1><span>1/2</span><a href="/api/materials/download?lessonId=x">PDF</a>');assert.equal(r.videoUrl,null);assert.equal(r.mediaType,'NONE');assert.equal(r.hasMaterialsLinks,true);assert.equal(r.nativeDownloadAvailable,false);});
+
+test('native lesson download is detected independently from materials',()=>{
+  const h='<h2>C</h2><h1>A</h1><span>1/2</span><a href="/api/materials/download?lessonId=x&index=0">PDF</a><a href="https://www.xcursos.com/api/video/download?lessonId=lesson-123">Baixar aula</a><video src="https://cdn/x.mp4"></video>';
+  const r=parseXcursosLessonHtml(h,'https://www.xcursos.com/curso/c/aula/a');
+  assert.equal(r.nativeDownloadAvailable,true);
+  assert.equal(r.nativeDownloadUrl,'https://www.xcursos.com/api/video/download?lessonId=lesson-123');
+  assert.equal(r.hasMaterialsLinks,true);
+  assert.equal(r.mediaType,'DIRECT_MP4');
+});
+
+test('native lesson download rejects cross-origin and malformed lookalikes',()=>{
+  const cross=parseXcursosLessonHtml('<h2>C</h2><h1>A</h1>1/2<a href="https://evil.example/api/video/download?lessonId=x">Baixar aula</a>','https://www.xcursos.com/curso/c/aula/a');
+  const missingId=parseXcursosLessonHtml('<h2>C</h2><h1>A</h1>1/2<a href="/api/video/download">Baixar aula</a>','https://www.xcursos.com/curso/c/aula/a');
+  assert.equal(cross.nativeDownloadAvailable,false);
+  assert.equal(missingId.nativeDownloadAvailable,false);
+});
 
 test('direct media wins over iframe',()=>{const r=parseXcursosLessonHtml('<h2>C</h2><h1>A</h1>1/2<iframe src="https://x/embed"></iframe><video src="https://cdn/x.mp4"></video>');assert.equal(r.mediaType,'DIRECT_MP4');});
 
