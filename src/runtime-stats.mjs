@@ -1,5 +1,20 @@
+const ETA_MIN_SAMPLES=3;
+const ETA_WINDOW_SIZE=21;
+
 function fmt(ms){if(ms==null)return null;const sec=Math.max(0,Math.round(ms/1000));const h=Math.floor(sec/3600),m=Math.floor((sec%3600)/60),s=sec%60;return`${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;}
 function ints(values=[]){return new Set((Array.isArray(values)?values:[]).map(Number).filter(Number.isInteger));}
+function mean(values=[]){return values.length?values.reduce((a,b)=>a+b,0)/values.length:null;}
+function median(values=[]){
+  if(!values.length)return null;const sorted=[...values].sort((a,b)=>a-b);const mid=Math.floor(sorted.length/2);
+  return sorted.length%2?sorted[mid]:(sorted[mid-1]+sorted[mid])/2;
+}
+export function robustEtaLessonDuration(samples=[]){
+  const recent=(Array.isArray(samples)?samples:[]).map(Number).filter(Number.isFinite).filter(x=>x>=0).slice(-ETA_WINDOW_SIZE);
+  if(recent.length<ETA_MIN_SAMPLES)return null;
+  if(recent.length<5)return Math.round(median(recent));
+  const sorted=[...recent].sort((a,b)=>a-b);const trim=Math.max(1,Math.floor(sorted.length*0.2));const trimmed=sorted.slice(trim,sorted.length-trim);
+  return Math.round(mean(trimmed.length?trimmed:sorted));
+}
 
 export class RuntimeStats {
   constructor({total=0,nowFn=Date.now}={}){
@@ -49,9 +64,17 @@ export class RuntimeStats {
     const coverageProcessed=this.baseProcessed+this.coveragePositions.size;
     const healthy=this.baseHealthy+this.healthyPositions.size;
     const downloadsSucceeded=this.baseDownloadsSucceeded+this.downloadedPositions.size;
-    const averageLessonDurationMs=this.samples.length?Math.round(this.samples.reduce((a,b)=>a+b,0)/this.samples.length):null;
-    const remaining=Math.max(0,this.total-coverageProcessed);const etaMs=averageLessonDurationMs==null?null:averageLessonDurationMs*remaining;
-    return{total:this.total,processed:coverageProcessed,coverageProcessed,runOperations:this.runOperations,healthy,currentPosition:this.current?.position??null,currentTitle:this.current?.title??null,downloadsSucceeded,downloadsFailed:this.downloadsFailed,retries:this.retries,retryPending:this.retryPending,browserReconnects:this.browserReconnects,mediaRefreshes:this.mediaRefreshes,repositionSteps:this.repositionSteps,elapsedMs,elapsed:fmt(elapsedMs),averageLessonDurationMs,downloadBytes:this.downloadBytes,downloadSpeed:this.lastDownloadSpeed,etaMs,ETA:fmt(etaMs)};
+    const averageLessonDurationMs=this.samples.length?Math.round(mean(this.samples)):null;
+    const etaSampleCount=Math.min(this.samples.length,ETA_WINDOW_SIZE);
+    const etaLessonDurationMs=robustEtaLessonDuration(this.samples);
+    const remaining=Math.max(0,this.total-coverageProcessed);
+    const etaMs=remaining===0?0:(etaLessonDurationMs==null?null:etaLessonDurationMs*remaining);
+    const etaStatus=remaining===0?'COMPLETE':(etaLessonDurationMs==null?'CALCULATING':'READY');
+    return{total:this.total,processed:coverageProcessed,coverageProcessed,runOperations:this.runOperations,healthy,currentPosition:this.current?.position??null,currentTitle:this.current?.title??null,downloadsSucceeded,downloadsFailed:this.downloadsFailed,retries:this.retries,retryPending:this.retryPending,browserReconnects:this.browserReconnects,mediaRefreshes:this.mediaRefreshes,repositionSteps:this.repositionSteps,elapsedMs,elapsed:fmt(elapsedMs),averageLessonDurationMs,etaLessonDurationMs,etaSampleCount,etaMinimumSamples:ETA_MIN_SAMPLES,etaStatus,downloadBytes:this.downloadBytes,downloadSpeed:this.lastDownloadSpeed,etaMs,ETA:fmt(etaMs)};
   }
-  render(){const s=this.snapshot();return`[STATS] ${s.coverageProcessed}/${s.total} | ops=${s.runOperations} | retry=${s.retryPending} | elapsed=${s.elapsed}${s.ETA?` | ETA=${s.ETA}`:''}`;}
+  render(){
+    const s=this.snapshot();
+    const eta=s.etaStatus==='READY'?` | ETA=${s.ETA}`:(s.etaStatus==='CALCULATING'?` | ETA=calculando... (${s.etaSampleCount}/${s.etaMinimumSamples})`:'');
+    return`[STATS] ${s.coverageProcessed}/${s.total} | ops=${s.runOperations} | retry=${s.retryPending} | elapsed=${s.elapsed}${eta}`;
+  }
 }
