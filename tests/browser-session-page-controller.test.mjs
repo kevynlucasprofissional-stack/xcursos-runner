@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { BrowserSession } from '../src/browser-session.mjs';
+import { BrowserSession, findConnectedPageByUrl } from '../src/browser-session.mjs';
 import { safePageContent } from '../src/safe-page-content.mjs';
 import { classifyNavigation, RedirectAuthObserver } from '../src/redirect-auth-observer.mjs';
 import { PageController } from '../src/page-controller.mjs';
@@ -16,6 +16,13 @@ test('BrowserSession owns CDP lifecycle and knows nothing about XCursos semantic
   const context=new Context([new Page()]);const capture={};const session=new BrowserSession({playwrightLoader:loader(context,capture)});
   await session.connect();assert.equal(session.isConnected(),true);assert.equal((await session.getPages()).length,1);assert.equal('inspectLesson' in session,false);assert.equal('clickNext' in session,false);
   capture.browser.connected=false;await session.reconnect();assert.equal(session.isConnected(),true);await session.disconnect();assert.equal(session.isConnected(),false);
+});
+
+test('active CDP page can be resolved by exact lesson URL only while session is connected',async()=>{
+  const page=new Page('https://www.xcursos.com/curso/c/aula/123');const context=new Context([page]);const session=new BrowserSession({playwrightLoader:loader(context)});
+  assert.equal(await findConnectedPageByUrl(page.url()),null);
+  await session.connect();assert.equal(await findConnectedPageByUrl(page.url()),page);assert.equal(await findConnectedPageByUrl('https://www.xcursos.com/curso/c/aula/999'),null);
+  await session.disconnect();assert.equal(await findConnectedPageByUrl(page.url()),null);
 });
 
 test('PageController owns lesson semantics over an injected BrowserSession',async()=>{
