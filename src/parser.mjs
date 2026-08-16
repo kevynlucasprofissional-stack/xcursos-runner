@@ -22,6 +22,10 @@ function hostOf(url=''){
   try{return new URL(String(url)).hostname.toLowerCase();}catch{return '';}
 }
 
+export function isAnalyticsIframeUrl(url=''){
+  const host=hostOf(url);return Boolean(host&&ANALYTICS_HOST_RE.test(host));
+}
+
 export function isTrustedPlayerIframeUrl(url=''){
   const host=hostOf(url);if(!host||ANALYTICS_HOST_RE.test(host))return false;
   return TRUSTED_PLAYER_HOSTS.some(allowed=>host===allowed||host.endsWith(`.${allowed}`));
@@ -38,6 +42,15 @@ export function isSafeDownloadMedia(meta={}){
   const native=normalizeNativeDownloadUrl(meta?.nativeDownloadUrl||'',meta?.pageUrl||'');
   if(meta?.nativeDownloadAvailable&&native)return true;
   return mediaSourceConfidence(meta)!=='UNTRUSTED';
+}
+
+export function isMaterialOnlyLesson(meta={}){
+  if(!meta?.hasMaterialsLinks)return false;
+  if(meta?.nativeDownloadAvailable||normalizeNativeDownloadUrl(meta?.nativeDownloadUrl||'',meta?.pageUrl||''))return false;
+  if(isSafeDownloadMedia(meta)||meta?.videoUrl)return false;
+  if(meta?.hasVideoElement||meta?.hasTrustedPlayerIframe||meta?.hasNonAnalyticsIframe)return false;
+  if(meta?.drmDetected)return false;
+  return String(meta?.mediaType||'NONE')==='NONE';
 }
 
 export function normalizeModulePath(modulePath=[],moduleName=null){
@@ -159,6 +172,7 @@ export function parseXcursosLessonHtml(html, pageUrl = '') {
   const iframeUrls=(value.match(/<iframe\b[^>]*>/gi)||[]).map(x=>attr(x,'src')).filter(Boolean);
   const hasTrustedPlayerIframe=iframeUrls.some(isTrustedPlayerIframeUrl);
   const hasUntrustedIframe=iframeUrls.some(x=>!isTrustedPlayerIframeUrl(x));
+  const hasNonAnalyticsIframe=iframeUrls.some(x=>!isAnalyticsIframeUrl(x));
   const result={
     site: 'xcursos',pageUrl,pageTitle,courseName: courseName || 'Curso XCursos',lessonTitle: lessonTitle || 'Aula',moduleName,modulePath:normalizeModulePath([],moduleName),
     currentPosition: counter?.current ?? null,totalPositions: counter?.total ?? null,
@@ -166,9 +180,9 @@ export function parseXcursosLessonHtml(html, pageUrl = '') {
     nativeDownloadUrl,nativeDownloadAvailable:Boolean(nativeDownloadUrl),
     isSignedDirectMp4: Boolean(media?.type === 'DIRECT_MP4' && /[?&]X-Amz-/i.test(media.url)),
     hasMaterialsLinks: value.includes(MATERIALS_PATH),drmDetected: detectDrm(value),
-    hasVideoElement:videoTags.length>0,hasTrustedPlayerIframe,hasUntrustedIframe,
+    hasVideoElement:videoTags.length>0,hasTrustedPlayerIframe,hasUntrustedIframe,hasNonAnalyticsIframe,
   };
-  return {...result,mediaSourceConfidence:mediaSourceConfidence(result)};
+  return {...result,mediaSourceConfidence:mediaSourceConfidence(result),materialOnly:isMaterialOnlyLesson(result)};
 }
 
 export function normalizeLiveLessonMeta(meta = {}, page = {}) {
@@ -178,6 +192,7 @@ export function normalizeLiveLessonMeta(meta = {}, page = {}) {
   const current = Number(meta.currentPosition); const total = Number(meta.totalPositions);
   const hasTrustedPlayerIframe=Boolean(meta.hasTrustedPlayerIframe||(meta.iframeUrl&&isTrustedPlayerIframeUrl(meta.iframeUrl)));
   const hasUntrustedIframe=Boolean(meta.hasUntrustedIframe||(meta.iframeUrl&&!isTrustedPlayerIframeUrl(meta.iframeUrl)));
+  const hasNonAnalyticsIframe=Boolean(meta.hasNonAnalyticsIframe||(meta.iframeUrl&&!isAnalyticsIframeUrl(meta.iframeUrl)));
   const modulePath=normalizeModulePath(meta.modulePath,meta.moduleName);
   const pageUrl=meta.pageUrl || page.url || '';
   const nativeDownloadUrl=normalizeNativeDownloadUrl(meta.nativeDownloadUrl||null,pageUrl);
@@ -189,7 +204,7 @@ export function normalizeLiveLessonMeta(meta = {}, page = {}) {
     nativeDownloadUrl,nativeDownloadAvailable:Boolean(nativeDownloadUrl),
     isSignedDirectMp4: Boolean(media?.type === 'DIRECT_MP4' && /[?&]X-Amz-/i.test(media.url)),
     hasMaterialsLinks: Boolean(meta.hasMaterialsLinks),drmDetected: Boolean(meta.drmDetected),
-    hasVideoElement:Boolean(meta.hasVideoElement),hasTrustedPlayerIframe,hasUntrustedIframe,
+    hasVideoElement:Boolean(meta.hasVideoElement),hasTrustedPlayerIframe,hasUntrustedIframe,hasNonAnalyticsIframe,
   };
-  return {...result,mediaSourceConfidence:mediaSourceConfidence(result)};
+  return {...result,mediaSourceConfidence:mediaSourceConfidence(result),materialOnly:isMaterialOnlyLesson(result)};
 }
