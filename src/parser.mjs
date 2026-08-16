@@ -1,4 +1,4 @@
-import { MATERIALS_PATH } from './constants.mjs';
+import { MATERIALS_PATH, VIDEO_DOWNLOAD_PATH, XCURSOS_ORIGIN } from './constants.mjs';
 import { decodeHtmlEntities, redactUrl, stripTags } from './utils.mjs';
 
 const TRUSTED_PLAYER_HOSTS = [
@@ -42,6 +42,23 @@ export function normalizeModulePath(modulePath=[],moduleName=null){
   const raw=Array.isArray(modulePath)?modulePath:[];const out=[];
   for(const value of raw){const text=String(value||'').trim();if(text&&out.at(-1)!==text)out.push(text);}
   const fallback=String(moduleName||'').trim();if(!out.length&&fallback)out.push(fallback);return out;
+}
+
+export function normalizeNativeDownloadUrl(rawUrl='',pageUrl=''){
+  if(!rawUrl)return null;
+  try{
+    const url=new URL(decodeHtmlEntities(String(rawUrl)),pageUrl||XCURSOS_ORIGIN);
+    if(url.origin!==XCURSOS_ORIGIN||url.pathname!==VIDEO_DOWNLOAD_PATH||!url.searchParams.get('lessonId'))return null;
+    return url.toString();
+  }catch{return null;}
+}
+
+export function extractNativeDownloadUrl(html='',pageUrl=''){
+  for(const anchor of String(html).match(/<a\b[^>]*>/gi)||[]){
+    const href=attr(anchor,'href');const normalized=normalizeNativeDownloadUrl(href,pageUrl);
+    if(normalized)return normalized;
+  }
+  return null;
 }
 
 export function parseCounter(text = '') {
@@ -132,6 +149,7 @@ export function parseXcursosLessonHtml(html, pageUrl = '') {
   const lessonTitle = h1s[0] || null;
   const counter = parseCounter(bodyText);
   const media = extractMedia(value);
+  const nativeDownloadUrl=extractNativeDownloadUrl(value,pageUrl);
   const courseName = chooseCourseName(value);
   const moduleName = chooseModuleName(value, lessonTitle);
   const pageTitle = tagTexts(value, 'title')[0] || null;
@@ -143,6 +161,7 @@ export function parseXcursosLessonHtml(html, pageUrl = '') {
     site: 'xcursos',pageUrl,pageTitle,courseName: courseName || 'Curso XCursos',lessonTitle: lessonTitle || 'Aula',moduleName,modulePath:normalizeModulePath([],moduleName),
     currentPosition: counter?.current ?? null,totalPositions: counter?.total ?? null,
     videoUrl: media?.url || null,videoUrlRedacted: media?.redacted || null,mediaType: media?.type || 'NONE',mediaSource: media?.source || null,
+    nativeDownloadUrl,nativeDownloadAvailable:Boolean(nativeDownloadUrl),
     isSignedDirectMp4: Boolean(media?.type === 'DIRECT_MP4' && /[?&]X-Amz-/i.test(media.url)),
     hasMaterialsLinks: value.includes(MATERIALS_PATH),drmDetected: detectDrm(value),
     hasVideoElement:videoTags.length>0,hasTrustedPlayerIframe,hasUntrustedIframe,
@@ -158,11 +177,14 @@ export function normalizeLiveLessonMeta(meta = {}, page = {}) {
   const hasTrustedPlayerIframe=Boolean(meta.hasTrustedPlayerIframe||(meta.iframeUrl&&isTrustedPlayerIframeUrl(meta.iframeUrl)));
   const hasUntrustedIframe=Boolean(meta.hasUntrustedIframe||(meta.iframeUrl&&!isTrustedPlayerIframeUrl(meta.iframeUrl)));
   const modulePath=normalizeModulePath(meta.modulePath,meta.moduleName);
+  const pageUrl=meta.pageUrl || page.url || '';
+  const nativeDownloadUrl=normalizeNativeDownloadUrl(meta.nativeDownloadUrl||null,pageUrl);
   const result={
-    site: 'xcursos',pageUrl: meta.pageUrl || page.url || '',pageTitle: meta.pageTitle || page.title || null,
+    site: 'xcursos',pageUrl,pageTitle: meta.pageTitle || page.title || null,
     courseName: String(meta.courseName || '').trim() || 'Curso XCursos',lessonTitle: String(meta.lessonTitle || '').trim() || 'Aula',moduleName:modulePath.at(-1)||String(meta.moduleName || '').trim()||null,modulePath,
     currentPosition: Number.isFinite(current) && current > 0 ? current : null,totalPositions: Number.isFinite(total) && total > 1 ? total : null,
     videoUrl: media?.url || null,videoUrlRedacted: media?.redacted || null,mediaType: media?.type || 'NONE',mediaSource: media?.source || null,
+    nativeDownloadUrl,nativeDownloadAvailable:Boolean(nativeDownloadUrl),
     isSignedDirectMp4: Boolean(media?.type === 'DIRECT_MP4' && /[?&]X-Amz-/i.test(media.url)),
     hasMaterialsLinks: Boolean(meta.hasMaterialsLinks),drmDetected: Boolean(meta.drmDetected),
     hasVideoElement:Boolean(meta.hasVideoElement),hasTrustedPlayerIframe,hasUntrustedIframe,
