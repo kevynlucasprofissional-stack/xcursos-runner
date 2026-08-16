@@ -35,6 +35,8 @@ export function mediaSourceConfidence({videoUrl=null,mediaType='NONE'}={}){
 }
 
 export function isSafeDownloadMedia(meta={}){
+  const native=normalizeNativeDownloadUrl(meta?.nativeDownloadUrl||'',meta?.pageUrl||'');
+  if(meta?.nativeDownloadAvailable&&native)return true;
   return mediaSourceConfidence(meta)!=='UNTRUSTED';
 }
 
