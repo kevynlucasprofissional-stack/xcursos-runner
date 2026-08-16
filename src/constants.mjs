@@ -33,6 +33,7 @@ export const DEFAULT_LIMITS = Object.freeze({
   nextRecoveryObservationMs: 750,
   mediaReadyTimeoutMs: 12_000,
   mediaReadyPollMs: 250,
+  nativeDownloadEventTimeoutMs: 15_000,
   navigationRetries: 1,
   mediaRefreshRetries: 2,
   downloadRetries: 2,
