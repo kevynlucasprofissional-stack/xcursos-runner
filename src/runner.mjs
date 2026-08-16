@@ -45,7 +45,7 @@ export class XCursosCourseRunner {
     this.runtimeStats=runtimeStats || new RuntimeStats({total:0});
     this.browserSession=browserSession || (!browser && !pageController ? new BrowserSession({cdpEndpoint,logger:this.logger,limits:this.limits,playwrightLoader,runtimeStats:this.runtimeStats}) : null);
     this.pageController=pageController || browser || new PageController({session:this.browserSession,logger:this.logger,limits:this.limits});
-    this.browser=this.pageController; // backwards-compatible alias for injected test doubles and older integrations.
+    this.browser=this.pageController;
     this.downloader=downloader || new MediaDownloader({logger:this.logger,limits:this.limits});
     this.retryPolicy=retryPolicy || new RetryPolicy({baseDelayMs:this.limits.retryBaseDelayMs,maxDelayMs:this.limits.retryMaxDelayMs,maxAttempts:Math.max(1,Number(this.limits.downloadRetries||0)+1),jitterRatio:this.limits.retryJitterRatio});
     this.schedulerFactory=schedulerFactory || (opts=>new LessonScheduler(opts));
@@ -202,7 +202,6 @@ export class XCursosCourseRunner {
   async ensurePageAt(position,{lessonUrl=null}={}){
     const target=Number(position);if(!Number.isInteger(target)||target<1||target>this.total)throw new RunnerError(`Posição de reposicionamento inválida: ${position}.`,{code:'RANGE_INVALID'});
     const strategiesTried=[];let explicitAllowed=Boolean(lessonUrl);let exactIndexAllowed=true;let current=null;
-    // Re-plan after stale index invalidation. The budget is bounded by the number of index entries plus fixed strategies.
     const budget=Math.max(6,(this.navigationIndex?.entries?.().length||0)+6);
     for(let iteration=0;iteration<budget;iteration++){
       current=await this.browser.inspectLesson(this.workPage);
@@ -335,7 +334,7 @@ export class XCursosCourseRunner {
     else {
       await fs.mkdir(paths.moduleDir,{recursive:true});
       if(!repair && !this.state.getInFlight(position)){
-        await this.state.setInFlight({position,lessonTitle:lesson.lessonTitle,moduleName:lesson.moduleName,modulePath:lesson.modulePath,lessonUrl:lesson.pageUrl||this.workPage.url,relativeOutputBase:path.relative(this.state.courseDir,path.join(paths.moduleDir,paths.baseName))});
+        await this.state.setInFlight({position,lessonTitle:lesson.lessonTitle,moduleName:lesson.moduleName,modulePath:lesson.modulePath,lessonTitle:lesson.lessonTitle,lessonUrl:lesson.pageUrl||this.workPage.url,relativeOutputBase:path.relative(this.state.courseDir,path.join(paths.moduleDir,paths.baseName))});
       }
       let existingFile=await this.downloader.findExistingFinal(paths.moduleDir,paths.baseName);
       if(existingFile){
@@ -580,7 +579,7 @@ export async function downloadCurrentLesson(options={}){const r=new XCursosCours
 export async function downloadRange(options={}){const r=new XCursosCourseRunner(options);try{return await r.runRange({start:options.start,end:options.end,resume:options.resume??true,finalAudit:false});}finally{await r.dispose({cleanupPages:true});}}
 export async function downloadCourse(options={}){
   const r=new XCursosCourseRunner(options);
-  try{return await r.runCourse({resume:options.resume??true});
+  try{return await r.runCourse({resume:options.resume??true});}
   catch(error){
     let audit=null;
     try{
