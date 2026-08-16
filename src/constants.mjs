@@ -1,6 +1,7 @@
 export const XCURSOS_ORIGIN = 'https://www.xcursos.com';
 export const XCURSOS_HOME_URL = `${XCURSOS_ORIGIN}/`;
 export const MATERIALS_PATH = '/api/materials/download';
+export const VIDEO_DOWNLOAD_PATH = '/api/video/download';
 export const LESSON_URL_RE = /^https:\/\/www\.xcursos\.com\/curso\/[^/]+\/aula\/[^/?#]+/i;
 
 export const TERMINAL_STATUSES = new Set([
