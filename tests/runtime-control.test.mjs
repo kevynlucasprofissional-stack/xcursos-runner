@@ -1,18 +1,34 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { RuntimeStats } from '../src/runtime-stats.mjs';
+import { RuntimeStats, robustEtaLessonDuration } from '../src/runtime-stats.mjs';
 import { AutoThrottle } from '../src/auto-throttle.mjs';
 import { GracefulShutdownController } from '../src/shutdown-controller.mjs';
 
-test('RuntimeStats ETA is unknown before samples and stable after terminal samples',()=>{
+test('RuntimeStats waits for enough samples before publishing ETA, then uses a robust estimate',()=>{
   let now=0;const s=new RuntimeStats({total:10,nowFn:()=>now});
-  assert.equal(s.snapshot().etaMs,null);
+  let x=s.snapshot();assert.equal(x.etaMs,null);assert.equal(x.etaStatus,'CALCULATING');assert.equal(x.etaSampleCount,0);
   s.beginLesson(1,'One');now=1000;s.finishLesson({status:'DOWNLOADED',healthy:true,bytes:100});
   s.beginLesson(2,'Two');now=3000;s.finishLesson({status:'DOWNLOADED',healthy:true,bytes:200});
-  const x=s.snapshot();assert.equal(x.processed,2);assert.equal(x.healthy,2);assert.equal(x.averageLessonDurationMs,1500);assert.equal(x.etaMs,12000);assert.equal(x.downloadBytes,300);
+  x=s.snapshot();assert.equal(x.processed,2);assert.equal(x.healthy,2);assert.equal(x.averageLessonDurationMs,1500);assert.equal(x.etaMs,null);assert.equal(x.etaStatus,'CALCULATING');assert.match(s.render(),/ETA=calculando\.\.\. \(2\/3\)/);assert.equal(x.downloadBytes,300);
+  s.beginLesson(3,'Three');now=4000;s.finishLesson({status:'DOWNLOADED',healthy:true,bytes:300});
+  x=s.snapshot();assert.equal(x.processed,3);assert.equal(x.averageLessonDurationMs,1333);assert.equal(x.etaLessonDurationMs,1000);assert.equal(x.etaMs,7000);assert.equal(x.etaStatus,'READY');assert.equal(x.ETA,'00:00:07');
 });
 
-test('RuntimeStats retries/failures do not inflate processed count',()=>{const s=new RuntimeStats({total:5});s.beginLesson(1,'A');s.recordRetry();s.recordFailure();assert.equal(s.snapshot().processed,0);assert.equal(s.snapshot().retries,1);assert.equal(s.snapshot().downloadsFailed,1);});
+test('robust ETA estimator stabilizes quickly for similar lesson times',()=>{
+  assert.equal(robustEtaLessonDuration([60_000,65_000,58_000,62_000]),61_000);
+});
+
+test('robust ETA estimator resists a single large outlier',()=>{
+  assert.equal(robustEtaLessonDuration([60_000,62_000,600_000,61_000,59_000]),61_000);
+});
+
+test('robust ETA estimator refuses to publish with fewer than three samples',()=>{
+  assert.equal(robustEtaLessonDuration([]),null);
+  assert.equal(robustEtaLessonDuration([60_000]),null);
+  assert.equal(robustEtaLessonDuration([60_000,62_000]),null);
+});
+
+test('RuntimeStats retries/failures do not inflate processed count or ETA samples',()=>{const s=new RuntimeStats({total:5});s.beginLesson(1,'A');s.recordRetry();s.recordFailure();const x=s.snapshot();assert.equal(x.processed,0);assert.equal(x.retries,1);assert.equal(x.downloadsFailed,1);assert.equal(x.etaSampleCount,0);assert.equal(x.etaMs,null);});
 
 test('AutoThrottle increases on instability, respects Retry-After/max, then decreases gradually on success',()=>{
   const t=new AutoThrottle({minDelayMs:100,maxDelayMs:3000,initialDelayMs:100});
@@ -34,7 +50,7 @@ test('runProcess force AbortSignal terminates a long subprocess with PROCESS_ABO
   await assert.rejects(promise,e=>e?.code==='PROCESS_ABORTED');
 });
 
-test('RuntimeStats can seed resume baseline without inventing ETA samples',()=>{const s=new RuntimeStats({total:10});s.seed({processed:4,healthy:4,downloadsSucceeded:3});const x=s.snapshot();assert.equal(x.processed,4);assert.equal(x.healthy,4);assert.equal(x.downloadsSucceeded,3);assert.equal(x.etaMs,null);});
+test('RuntimeStats can seed resume baseline without inventing ETA samples',()=>{const s=new RuntimeStats({total:10});s.seed({processed:4,healthy:4,downloadsSucceeded:3});const x=s.snapshot();assert.equal(x.processed,4);assert.equal(x.healthy,4);assert.equal(x.downloadsSucceeded,3);assert.equal(x.etaMs,null);assert.equal(x.etaSampleCount,0);assert.equal(x.etaStatus,'CALCULATING');});
 
 test('RuntimeStats does not inflate coverage when an already-covered position is operated again',()=>{
   let now=0;const s=new RuntimeStats({total:198,nowFn:()=>now});
@@ -48,6 +64,7 @@ test('RuntimeStats does not inflate coverage when an already-covered position is
   assert.equal(x.downloadsSucceeded,64);
   assert.equal(x.averageLessonDurationMs,null);
   assert.equal(x.etaMs,null);
+  assert.equal(x.etaSampleCount,0);
   assert.equal(x.downloadBytes,0);
 });
 
@@ -57,12 +74,20 @@ test('RuntimeStats ETA uses only newly covered positions from this run, never se
   s.seed({completedPositions:covered,healthyPositions:covered,downloadedPositions:covered});
   s.beginLesson(65,'new 65');now=1000;s.finishLesson({status:'DOWNLOADED',healthy:true,bytes:100});
   s.beginLesson(66,'new 66');now=3000;s.finishLesson({status:'DOWNLOADED',healthy:true,bytes:200});
-  const x=s.snapshot();
+  let x=s.snapshot();
   assert.equal(x.coverageProcessed,66);
   assert.equal(x.runOperations,2);
   assert.equal(x.averageLessonDurationMs,1500);
-  assert.equal(x.etaMs,6000);
-  assert.equal(x.downloadBytes,300);
+  assert.equal(x.etaMs,null);
+  assert.equal(x.etaSampleCount,2);
+  s.beginLesson(67,'new 67');now=4000;s.finishLesson({status:'DOWNLOADED',healthy:true,bytes:300});
+  x=s.snapshot();
+  assert.equal(x.coverageProcessed,67);
+  assert.equal(x.runOperations,3);
+  assert.equal(x.averageLessonDurationMs,1333);
+  assert.equal(x.etaLessonDurationMs,1000);
+  assert.equal(x.etaMs,3000);
+  assert.equal(x.downloadBytes,600);
 });
 
 import fs from 'node:fs/promises';
