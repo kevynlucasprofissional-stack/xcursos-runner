@@ -162,23 +162,32 @@ export class MediaDownloader {
   async download({ mediaUrl, refererUrl, paths, signal=null, onProgress=null, cleanStart=false }) {
     await fs.mkdir(paths.moduleDir,{recursive:true});
     if(cleanStart)await this.clearPartialArtifacts(paths.moduleDir,paths.baseName);
+
+    let nativeFailure=null;
+    const native=await this.tryNativeDownload({refererUrl,paths,signal});
+    if(native.ok)return native;
+    if(native.attempted){
+      nativeFailure={failureCode:native.failureCode||'NATIVE_DOWNLOAD_FAILED',diagnosticTail:native.diagnosticTail||null,quarantine:native.quarantine||null};
+      await this.logger?.log('NATIVE_FALLBACK','Native lesson download failed; falling back to yt-dlp',nativeFailure);
+    }
+
     const resumeArg=cleanStart?'--no-continue':'--continue';
     const args=['--no-playlist',resumeArg,'--no-overwrites','--retries','3','--fragment-retries','3','--referer',refererUrl,'--print','after_move:filepath','-o',paths.template,mediaUrl];
-    await this.logger?.log('DOWNLOAD','Starting',{media:redactUrl(mediaUrl),output:paths.template,cleanStart:Boolean(cleanStart)});
+    await this.logger?.log('DOWNLOAD','Starting yt-dlp fallback',{media:redactUrl(mediaUrl),output:paths.template,cleanStart:Boolean(cleanStart),nativeAttempted:Boolean(native.attempted)});
     let r;
     const feed=chunk=>{if(!onProgress)return;for(const line of String(chunk).split(/\r?\n/)){const p=parseYtDlpProgress(line);if(p)onProgress(p);}};
     try{r=await this.processRunner(this.ytDlpPath,args,{timeoutMs:this.limits.downloadTimeoutMs,signal,onStdout:feed,onStderr:feed});}
     catch(error){
       if(error?.code==='PROCESS_ABORTED')throw error;
       const failureCode=error?.code==='PROCESS_TIMEOUT'?'PROCESS_TIMEOUT':String(error?.code||'SPAWN_ERROR');
-      return {ok:false,kind:error?.code==='PROCESS_TIMEOUT'?'TIMEOUT':'SPAWN_ERROR',failureCode,diagnosticTail:diagnosticTail(error?.message||error),error};
+      return {ok:false,kind:error?.code==='PROCESS_TIMEOUT'?'TIMEOUT':'SPAWN_ERROR',failureCode,diagnosticTail:diagnosticTail(error?.message||error),error,...(nativeFailure?{nativeFailure}: {})};
     }
     const combined=`${r.stdout}\n${r.stderr}`;
-    if(r.code!==0){const failureCode=classifyYtDlpFailure(combined);return {ok:false,kind:failureCode==='DRM'?'DRM':looksExpired(combined)?'EXPIRED':'FAILED',failureCode,diagnosticTail:diagnosticTail(combined),code:r.code,stdout:r.stdout,stderr:r.stderr};}
+    if(r.code!==0){const failureCode=classifyYtDlpFailure(combined);return {ok:false,kind:failureCode==='DRM'?'DRM':looksExpired(combined)?'EXPIRED':'FAILED',failureCode,diagnosticTail:diagnosticTail(combined),code:r.code,stdout:r.stdout,stderr:r.stderr,...(nativeFailure?{nativeFailure}: {})};}
     let finalPath=r.stdout.split(/\r?\n/).map(x=>x.trim()).filter(Boolean).at(-1);
     if(!finalPath || !fsSync.existsSync(finalPath))finalPath=await this.findExistingFinal(paths.moduleDir,paths.baseName);
-    if(!finalPath)return {ok:false,kind:'NO_FINAL_PATH',code:r.code,stdout:r.stdout,stderr:r.stderr};
+    if(!finalPath)return {ok:false,kind:'NO_FINAL_PATH',code:r.code,stdout:r.stdout,stderr:r.stderr,...(nativeFailure?{nativeFailure}: {})};
     this.downloadMethodByPath.set(methodKey(finalPath),'YTDLP');
-    return {ok:true,finalPath,downloadMethod:'YTDLP',stdout:r.stdout,stderr:r.stderr};
+    return {ok:true,finalPath,downloadMethod:'YTDLP',stdout:r.stdout,stderr:r.stderr,...(nativeFailure?{nativeFailure}: {})};
   }
 }
