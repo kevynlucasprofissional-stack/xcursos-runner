@@ -1,12 +1,17 @@
 import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import { DEFAULT_LIMITS, VIDEO_DOWNLOAD_PATH } from './constants.mjs';
 import { RunnerError } from './errors.mjs';
 import { findConnectedPageByUrl } from './browser-session.mjs';
 import { normalizeNativeDownloadUrl } from './parser.mjs';
 import { findExecutable, runProcess } from './process.mjs';
 import { redactUrl, redactSensitiveText, sanitizeSegment, truncateWithHash } from './utils.mjs';
+
+const NATIVE_STAGING_DIR='.xcursos-download-staging';
+const NATIVE_BROWSER_LOCK=path.join(os.tmpdir(),'xcursos-runner-native-browser-download.lock');
+let nativeDownloadTail=Promise.resolve();
 
 function looksExpired(output='') { return /(?:HTTP Error 403|\b403\b|forbidden|signature.*expired|request has expired|expiredtoken)/i.test(output); }
 function looksDrm(output='') { return /(?:DRM|Widevine|PlayReady|FairPlay|encrypted media|This video is DRM protected)/i.test(output); }
@@ -29,6 +34,112 @@ function safeDownloadExtension(filename=''){const ext=path.extname(String(filena
 function methodKey(filePath=''){return path.resolve(String(filePath||''));}
 export function fileFingerprintFromStat(stat){return{size:Number(stat?.size)||0,mtimeMs:Number(stat?.mtimeMs)||0};}
 export function sameFileFingerprint(a,b){return Boolean(a&&b&&Number(a.size)===Number(b.size)&&Number(a.mtimeMs)===Number(b.mtimeMs));}
+
+async function serializeNativeDownload(task){
+  const previous=nativeDownloadTail;
+  let release;
+  nativeDownloadTail=new Promise(resolve=>{release=resolve;});
+  await previous.catch(()=>{});
+  try{return await task();}finally{release();}
+}
+
+function processAlive(pid){
+  if(!Number.isInteger(pid)||pid<=0)return false;
+  try{process.kill(pid,0);return true;}catch(error){return error?.code==='EPERM';}
+}
+async function acquireNativeBrowserLock({timeoutMs,signal=null,logger=null}={}){
+  const deadline=Date.now()+Math.max(1000,Number(timeoutMs)||1000);
+  const token=`${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  let loggedWait=false;
+  while(true){
+    if(signal?.aborted)throw new RunnerError('Download abortado.',{code:'PROCESS_ABORTED'});
+    try{
+      await fs.mkdir(NATIVE_BROWSER_LOCK);
+      await fs.writeFile(path.join(NATIVE_BROWSER_LOCK,'owner.json'),JSON.stringify({pid:process.pid,token,startedAt:new Date().toISOString()}),'utf8');
+      return async()=>{
+        try{
+          const owner=JSON.parse(await fs.readFile(path.join(NATIVE_BROWSER_LOCK,'owner.json'),'utf8'));
+          if(owner?.token===token)await fs.rm(NATIVE_BROWSER_LOCK,{recursive:true,force:true});
+        }catch(error){if(error?.code!=='ENOENT')await logger?.log?.('NATIVE_DOWNLOAD','Failed to release browser download lock',{failureCode:'NATIVE_LOCK_RELEASE_FAILED',diagnosticTail:diagnosticTail(error?.message||error)});}
+      };
+    }catch(error){
+      if(error?.code!=='EEXIST')throw new RunnerError('Não foi possível adquirir o lock global de download do Chrome.',{code:'NATIVE_LOCK_ACQUIRE_FAILED',cause:error});
+      let owner=null,stat=null;
+      try{owner=JSON.parse(await fs.readFile(path.join(NATIVE_BROWSER_LOCK,'owner.json'),'utf8'));}catch{}
+      try{stat=await fs.stat(NATIVE_BROWSER_LOCK);}catch{}
+      const ageMs=stat?Date.now()-stat.mtimeMs:0;
+      const stale=(owner?.pid&&!processAlive(Number(owner.pid)))||(!owner&&ageMs>60_000);
+      if(stale){await fs.rm(NATIVE_BROWSER_LOCK,{recursive:true,force:true}).catch(()=>{});continue;}
+      if(Date.now()>=deadline)throw new RunnerError('Outro download nativo está usando a política global do Chrome há tempo demais.',{code:'NATIVE_DOWNLOAD_LOCK_TIMEOUT',details:{ownerPid:owner?.pid??null}});
+      if(!loggedWait){loggedWait=true;await logger?.log?.('NATIVE_DOWNLOAD','Waiting for browser-global download routing lock',{ownerPid:owner?.pid??null});}
+      await new Promise(resolve=>setTimeout(resolve,200));
+    }
+  }
+}
+
+function nativeLessonId(url=''){
+  try{return new URL(String(url)).searchParams.get('lessonId')||null;}catch{return null;}
+}
+function isExpectedNativeUrl(actual='',expected=''){
+  const expectedId=nativeLessonId(expected);if(!expectedId)return false;
+  const normalized=normalizeNativeDownloadUrl(actual,expected);return Boolean(normalized&&nativeLessonId(normalized)===expectedId);
+}
+function delayReject(ms,error,signal=null){
+  return new Promise((_,reject)=>{
+    const timer=setTimeout(()=>{cleanup();reject(error);},Math.max(1,Number(ms)||1));
+    const onAbort=()=>{cleanup();reject(new RunnerError('Download abortado.',{code:'PROCESS_ABORTED'}));};
+    const cleanup=()=>{clearTimeout(timer);signal?.removeEventListener?.('abort',onAbort);};
+    if(signal?.aborted)return onAbort();
+    signal?.addEventListener?.('abort',onAbort,{once:true});
+  });
+}
+async function withTimeout(promise,ms,error,signal=null){return await Promise.race([promise,delayReject(ms,error,signal)]);}
+async function waitForFile(filePath,{timeoutMs=5000,signal=null}={}){
+  const end=Date.now()+Math.max(1,Number(timeoutMs)||1);
+  while(Date.now()<=end){
+    if(signal?.aborted)throw new RunnerError('Download abortado.',{code:'PROCESS_ABORTED'});
+    try{const stat=await fs.stat(filePath);if(stat.isFile()&&stat.size>0)return stat;}catch{}
+    await new Promise(resolve=>setTimeout(resolve,50));
+  }
+  throw new RunnerError(`Arquivo concluído pelo Chrome não apareceu no staging: ${path.basename(filePath)}`,{code:'NATIVE_STAGING_FILE_MISSING'});
+}
+async function cleanupStaging(stagingRoot){
+  try{await fs.rm(stagingRoot,{recursive:true,force:true});}catch(error){throw new RunnerError('Não foi possível limpar o staging de download nativo.',{code:'NATIVE_STAGING_CLEANUP_FAILED',cause:error,details:{stagingRoot}});}
+}
+function createCdpDownloadTracker(cdp,expectedUrl,{startTimeoutMs,completionTimeoutMs,signal=null}={}){
+  let guid=null,suggestedFilename='',startTimer=null,completionTimer=null,settledStart=false,settledCompletion=false;
+  let startResolve,startReject,completionResolve,completionReject;
+  const started=new Promise((resolve,reject)=>{startResolve=resolve;startReject=reject;});
+  const completed=new Promise((resolve,reject)=>{completionResolve=resolve;completionReject=reject;});
+  started.catch(()=>{});completed.catch(()=>{});
+  const cleanupTimers=()=>{if(startTimer)clearTimeout(startTimer);if(completionTimer)clearTimeout(completionTimer);};
+  const rejectStart=error=>{if(settledStart)return;settledStart=true;startReject(error);};
+  const rejectCompletion=error=>{if(settledCompletion)return;settledCompletion=true;completionReject(error);};
+  const onWillBegin=event=>{
+    if(guid||!isExpectedNativeUrl(event?.url||'',expectedUrl))return;
+    guid=String(event.guid||'');suggestedFilename=String(event.suggestedFilename||'');
+    if(!guid)return;
+    if(startTimer)clearTimeout(startTimer);settledStart=true;startResolve({guid,suggestedFilename,url:event.url||null});
+    completionTimer=setTimeout(()=>rejectCompletion(new RunnerError('Download nativo excedeu o tempo limite.',{code:'NATIVE_DOWNLOAD_TIMEOUT',details:{guid}})),Math.max(1,Number(completionTimeoutMs)||1));
+  };
+  const onProgress=event=>{
+    if(!guid||event?.guid!==guid)return;
+    if(event.state==='completed'){
+      if(completionTimer)clearTimeout(completionTimer);if(settledCompletion)return;settledCompletion=true;
+      completionResolve({guid,suggestedFilename,totalBytes:Number(event.totalBytes)||null,receivedBytes:Number(event.receivedBytes)||null});
+    }else if(event.state==='canceled'){
+      if(completionTimer)clearTimeout(completionTimer);
+      rejectCompletion(new RunnerError('Chrome cancelou o download nativo.',{code:'NATIVE_DOWNLOAD_CANCELED',details:{guid}}));
+    }
+  };
+  const onAbort=()=>{
+    const error=new RunnerError('Download abortado.',{code:'PROCESS_ABORTED'});rejectStart(error);rejectCompletion(error);
+  };
+  cdp.on?.('Browser.downloadWillBegin',onWillBegin);cdp.on?.('Browser.downloadProgress',onProgress);
+  startTimer=setTimeout(()=>rejectStart(new RunnerError('Chrome não emitiu Browser.downloadWillBegin para a aula atual.',{code:'NATIVE_CDP_START_TIMEOUT'})),Math.max(1,Number(startTimeoutMs)||1));
+  signal?.addEventListener?.('abort',onAbort,{once:true});
+  return{started,completed,get guid(){return guid;},dispose(){cleanupTimers();signal?.removeEventListener?.('abort',onAbort);cdp.off?.('Browser.downloadWillBegin',onWillBegin);cdp.off?.('Browser.downloadProgress',onProgress);}};
+}
 
 export class MediaDownloader {
   constructor({ processRunner = runProcess, logger = null, limits = {}, ytDlpPath = null, ffprobePath = null, pageResolver = findConnectedPageByUrl } = {}) {
@@ -109,62 +220,147 @@ export class MediaDownloader {
   }
 
   async tryNativeDownload({ refererUrl, paths, signal=null }={}) {
-    if(signal?.aborted)throw new RunnerError('Download abortado.',{code:'PROCESS_ABORTED'});
-    if(typeof this.pageResolver!=='function')return{attempted:false,ok:false,failureCode:'NATIVE_PAGE_RESOLVER_UNAVAILABLE'};
-    const page=await this.pageResolver(refererUrl);
-    if(!page||page.isClosed?.()===true||typeof page.locator!=='function'||typeof page.waitForEvent!=='function')return{attempted:false,ok:false,failureCode:'NATIVE_PAGE_UNAVAILABLE'};
-    let locator;
-    try{locator=page.locator(`a[href*="${VIDEO_DOWNLOAD_PATH}"]`).first();}catch{return{attempted:false,ok:false,failureCode:'NATIVE_BUTTON_UNAVAILABLE'};}
-    let count=0;try{count=await locator.count();}catch{return{attempted:false,ok:false,failureCode:'NATIVE_BUTTON_UNAVAILABLE'};}
-    if(count<1)return{attempted:false,ok:false,failureCode:'NATIVE_BUTTON_UNAVAILABLE'};
-    let href=null;try{href=await locator.getAttribute('href');}catch{}
-    const nativeDownloadUrl=normalizeNativeDownloadUrl(href,refererUrl);
-    if(!nativeDownloadUrl)return{attempted:false,ok:false,failureCode:'NATIVE_BUTTON_UNTRUSTED'};
+    return await serializeNativeDownload(async()=>{
+      if(signal?.aborted)throw new RunnerError('Download abortado.',{code:'PROCESS_ABORTED'});
+      if(typeof this.pageResolver!=='function')return{attempted:false,ok:false,failureCode:'NATIVE_PAGE_RESOLVER_UNAVAILABLE'};
+      const page=await this.pageResolver(refererUrl);
+      if(!page||page.isClosed?.()===true||typeof page.locator!=='function'||typeof page.waitForEvent!=='function')return{attempted:false,ok:false,failureCode:'NATIVE_PAGE_UNAVAILABLE'};
+      let locator;
+      try{locator=page.locator(`a[href*="${VIDEO_DOWNLOAD_PATH}"]`).first();}catch{return{attempted:false,ok:false,failureCode:'NATIVE_BUTTON_UNAVAILABLE'};}
+      let count=0;try{count=await locator.count();}catch{return{attempted:false,ok:false,failureCode:'NATIVE_BUTTON_UNAVAILABLE'};}
+      if(count<1)return{attempted:false,ok:false,failureCode:'NATIVE_BUTTON_UNAVAILABLE'};
+      let href=null;try{href=await locator.getAttribute('href');}catch{}
+      const nativeDownloadUrl=normalizeNativeDownloadUrl(href,refererUrl);
+      if(!nativeDownloadUrl)return{attempted:false,ok:false,failureCode:'NATIVE_BUTTON_UNTRUSTED'};
 
-    await fs.mkdir(paths.moduleDir,{recursive:true});
-    await this.logger?.log('NATIVE_DOWNLOAD','Starting browser download',{output:paths.template});
-    let download;
-    try{
-      [download]=await Promise.all([
-        page.waitForEvent('download',{timeout:this.limits.nativeDownloadEventTimeoutMs}),
-        locator.click({timeout:this.limits.nativeDownloadEventTimeoutMs,noWaitAfter:true}),
-      ]);
-    }catch(error){
-      return{attempted:true,ok:false,failureCode:'NATIVE_DOWNLOAD_EVENT_FAILED',diagnosticTail:diagnosticTail(error?.message||error),error};
-    }
-    if(signal?.aborted)throw new RunnerError('Download abortado.',{code:'PROCESS_ABORTED'});
-    let browserFailure=null;try{browserFailure=await download.failure();}catch(error){browserFailure=String(error?.message||error);}
-    if(browserFailure)return{attempted:true,ok:false,failureCode:'NATIVE_DOWNLOAD_FAILED',diagnosticTail:diagnosticTail(browserFailure)};
+      await fs.mkdir(paths.moduleDir,{recursive:true});
+      const stagingRoot=path.join(paths.moduleDir,NATIVE_STAGING_DIR);
+      await cleanupStaging(stagingRoot);
+      const attemptDir=path.join(stagingRoot,`n-${process.pid}-${Date.now()}`);
+      await fs.mkdir(attemptDir,{recursive:true});
 
-    let suggested='';try{suggested=download.suggestedFilename?.()||'';}catch{}
-    const ext=safeDownloadExtension(suggested);
-    const tempPath=path.join(paths.moduleDir,`${paths.baseName}.native-${process.pid}-${Date.now()}${ext}.part`);
-    try{await download.saveAs(tempPath);}catch(error){
-      try{await fs.rm(tempPath,{force:true});}catch{}
-      return{attempted:true,ok:false,failureCode:'NATIVE_SAVE_FAILED',diagnosticTail:diagnosticTail(error?.message||error),error};
-    }
-    if(signal?.aborted)throw new RunnerError('Download abortado.',{code:'PROCESS_ABORTED'});
+      let cdp=null,tracker=null,behaviorSet=false,download=null,success=false,cdpSetupError=null;
+      await this.logger?.log('NATIVE_DOWNLOAD','Starting browser download',{output:paths.template,staging:stagingRoot});
+      const releaseBrowserLock=await acquireNativeBrowserLock({timeoutMs:this.limits.downloadTimeoutMs+60_000,signal,logger:this.logger});
+      try{
+        const browser=page.context?.()?.browser?.()||null;
+        if(browser&&typeof browser.newBrowserCDPSession==='function'){
+          try{
+            cdp=await browser.newBrowserCDPSession();
+            tracker=createCdpDownloadTracker(cdp,nativeDownloadUrl,{startTimeoutMs:this.limits.nativeDownloadEventTimeoutMs,completionTimeoutMs:this.limits.downloadTimeoutMs,signal});
+            await cdp.send('Browser.setDownloadBehavior',{behavior:'allowAndName',downloadPath:attemptDir,eventsEnabled:true});
+            behaviorSet=true;
+          }catch(error){
+            cdpSetupError=error;tracker?.dispose?.();tracker=null;
+            await this.logger?.log('NATIVE_DOWNLOAD','CDP download routing unavailable; using Playwright path fallback',{failureCode:'NATIVE_CDP_SETUP_FAILED',diagnosticTail:diagnosticTail(error?.message||error)});
+          }
+        }else{
+          cdpSetupError=new RunnerError('Browser-level CDP session unavailable.',{code:'NATIVE_CDP_UNAVAILABLE'});
+        }
 
-    let validation;
-    try{validation=await this.validateVideo(tempPath,{signal});}
-    catch(error){
-      let quarantine=null;try{quarantine=await this.quarantineCorrupt(tempPath);}catch{}
-      return{attempted:true,ok:false,failureCode:error?.code||'NATIVE_VERIFY_FAILED',diagnosticTail:diagnosticTail(error?.message||error),quarantine,error};
-    }
+        const playwrightDownloadPromise=page.waitForEvent('download',{timeout:this.limits.nativeDownloadEventTimeoutMs}).then(value=>({ok:true,value}),error=>({ok:false,error}));
+        try{await locator.click({timeout:this.limits.nativeDownloadEventTimeoutMs,noWaitAfter:true});}
+        catch(error){return{attempted:true,ok:false,failureCode:'NATIVE_DOWNLOAD_EVENT_FAILED',diagnosticTail:diagnosticTail(error?.message||error),error};}
 
-    const finalPath=path.join(paths.moduleDir,`${paths.baseName}${ext}`);
-    try{
-      if(fsSync.existsSync(finalPath))throw new RunnerError('Arquivo final apareceu durante o download nativo.',{code:'DUPLICATE_OUTPUT_FILES'});
-      await fs.rename(tempPath,finalPath);
-    }catch(error){
-      try{await fs.rm(tempPath,{force:true});}catch{}
-      return{attempted:true,ok:false,failureCode:error?.code||'NATIVE_PROMOTE_FAILED',diagnosticTail:diagnosticTail(error?.message||error),error};
-    }
-    const tempKey=methodKey(tempPath),finalKey=methodKey(finalPath);this.validationCacheByPath.delete(tempKey);this.downloadMethodByPath.delete(tempKey);
-    this.downloadMethodByPath.set(finalKey,'XCURSOS_NATIVE');
-    const finalValidation={...validation,downloadMethod:'XCURSOS_NATIVE'};this.validationCacheByPath.set(finalKey,{fingerprint:validation.fileFingerprint,validation:finalValidation});
-    await this.logger?.log('NATIVE_DOWNLOAD','Completed and validated',{output:finalPath,duration:validation.duration,size:validation.size});
-    return{attempted:true,ok:true,finalPath,downloadMethod:'XCURSOS_NATIVE',validation:finalValidation};
+        let sourcePath=null,suggestedFilename='',guid=null,completionMode=null;
+        if(behaviorSet&&tracker){
+          let started=null,startError=null;
+          try{started=await tracker.started;}catch(error){startError=error;}
+          if(started){
+            guid=started.guid;suggestedFilename=started.suggestedFilename||'';
+            try{
+              const cdpCompletion=tracker.completed.then(async event=>{
+                const file=path.join(attemptDir,event.guid);await waitForFile(file,{timeoutMs:5000,signal});
+                return{mode:'CDP',path:file,guid:event.guid,suggestedFilename:event.suggestedFilename||started.suggestedFilename||''};
+              });
+              const playwrightCompletion=playwrightDownloadPromise.then(async result=>{
+                // Playwright é apenas uma confirmação alternativa de sucesso. Falha desse
+                // observador não pode cancelar um download que o CDP ainda acompanha.
+                if(!result.ok)return await new Promise(()=>{});download=result.value;
+                let browserFailure=null;try{browserFailure=await download.failure();}catch{return await new Promise(()=>{});}
+                if(browserFailure)return await new Promise(()=>{});
+                try{
+                  const file=await withTimeout(download.path(),this.limits.downloadTimeoutMs,new RunnerError('Playwright não retornou o caminho do download a tempo.',{code:'NATIVE_DOWNLOAD_TIMEOUT'}),signal);
+                  if(!file)return await new Promise(()=>{});
+                  return{mode:'PLAYWRIGHT_PATH',path:file,guid,suggestedFilename:download.suggestedFilename?.()||suggestedFilename};
+                }catch{return await new Promise(()=>{});}
+              });
+              // race (não Promise.any): cancelamento/erro CDP deve vencer imediatamente e nunca
+              // ser mascarado por um caminho parcial que o Playwright eventualmente exponha.
+              const completed=await Promise.race([cdpCompletion,playwrightCompletion]);
+              sourcePath=completed.path;guid=completed.guid||guid;suggestedFilename=completed.suggestedFilename||suggestedFilename;completionMode=completed.mode;
+            }catch(error){
+              if(tracker.guid&&cdp)await cdp.send('Browser.cancelDownload',{guid:tracker.guid}).catch(()=>{});
+              return{attempted:true,ok:false,failureCode:error?.code||'NATIVE_DOWNLOAD_FAILED',diagnosticTail:diagnosticTail(error?.message||error),error};
+            }
+          }else{
+            // Browser.downloadWillBegin não chegou. A política CDP já foi aplicada, mas o
+            // Playwright ainda pode provar a conclusão por download.path() sem cópia.
+            const result=await playwrightDownloadPromise;
+            if(!result.ok)return{attempted:true,ok:false,failureCode:startError?.code||'NATIVE_DOWNLOAD_EVENT_FAILED',diagnosticTail:diagnosticTail(startError?.message||result.error?.message||result.error),error:startError||result.error};
+            download=result.value;
+            let browserFailure=null;try{browserFailure=await download.failure();}catch(error){browserFailure=String(error?.message||error);}
+            if(browserFailure)return{attempted:true,ok:false,failureCode:'NATIVE_DOWNLOAD_FAILED',diagnosticTail:diagnosticTail(browserFailure)};
+            suggestedFilename=download.suggestedFilename?.()||'';
+            try{sourcePath=await withTimeout(download.path(),this.limits.downloadTimeoutMs,new RunnerError('Playwright não retornou o caminho do download a tempo.',{code:'NATIVE_DOWNLOAD_TIMEOUT'}),signal);}catch(error){return{attempted:true,ok:false,failureCode:error?.code||startError?.code||'NATIVE_PATH_UNAVAILABLE',diagnosticTail:diagnosticTail(error?.message||error),error};}
+            completionMode='PLAYWRIGHT_PATH';
+          }
+        }else{
+          const result=await playwrightDownloadPromise;
+          if(!result.ok)return{attempted:true,ok:false,failureCode:'NATIVE_DOWNLOAD_EVENT_FAILED',diagnosticTail:diagnosticTail(result.error?.message||result.error),error:result.error,cdpFailure:cdpSetupError?diagnosticTail(cdpSetupError?.message||cdpSetupError):null};
+          download=result.value;
+          let browserFailure=null;try{browserFailure=await download.failure();}catch(error){browserFailure=String(error?.message||error);}
+          if(browserFailure)return{attempted:true,ok:false,failureCode:'NATIVE_DOWNLOAD_FAILED',diagnosticTail:diagnosticTail(browserFailure)};
+          suggestedFilename=download.suggestedFilename?.()||'';
+          try{sourcePath=await download.path();}catch{}
+          completionMode='PLAYWRIGHT_PATH';
+        }
+
+        if(signal?.aborted)throw new RunnerError('Download abortado.',{code:'PROCESS_ABORTED'});
+        const ext=safeDownloadExtension(suggestedFilename);
+        let stagedPath=sourcePath;
+        if(!stagedPath||!fsSync.existsSync(stagedPath)){
+          if(!download){const result=await playwrightDownloadPromise;if(result.ok)download=result.value;}
+          if(!download)return{attempted:true,ok:false,failureCode:'NATIVE_PATH_UNAVAILABLE',diagnosticTail:'Download concluído sem arquivo acessível.'};
+          stagedPath=path.join(attemptDir,`fallback${ext}.part`);
+          try{await download.saveAs(stagedPath);completionMode='PLAYWRIGHT_SAVEAS';}
+          catch(error){return{attempted:true,ok:false,failureCode:'NATIVE_SAVE_FAILED',diagnosticTail:diagnosticTail(error?.message||error),error};}
+        }else if(path.dirname(path.resolve(stagedPath))!==path.resolve(attemptDir)){
+          const movedPath=path.join(attemptDir,`moved${ext}.part`);
+          try{await fs.rename(stagedPath,movedPath);stagedPath=movedPath;completionMode='PLAYWRIGHT_RENAME';}
+          catch(error){
+            if(!download){const result=await playwrightDownloadPromise;if(result.ok)download=result.value;}
+            if(!download)return{attempted:true,ok:false,failureCode:'NATIVE_MOVE_FAILED',diagnosticTail:diagnosticTail(error?.message||error),error};
+            try{await download.saveAs(movedPath);await fs.rm(stagedPath,{force:true}).catch(()=>{});stagedPath=movedPath;completionMode='PLAYWRIGHT_SAVEAS';}
+            catch(copyError){return{attempted:true,ok:false,failureCode:'NATIVE_SAVE_FAILED',diagnosticTail:diagnosticTail(copyError?.message||copyError),error:copyError};}
+          }
+        }
+
+        if(/\.crdownload$/i.test(stagedPath))return{attempted:true,ok:false,failureCode:'NATIVE_DOWNLOAD_INCOMPLETE',diagnosticTail:'Arquivo .crdownload não pode ser promovido.'};
+        let validation;
+        try{validation=await this.validateVideo(stagedPath,{signal});}
+        catch(error){return{attempted:true,ok:false,failureCode:error?.code||'NATIVE_VERIFY_FAILED',diagnosticTail:diagnosticTail(error?.message||error),error};}
+
+        const finalPath=path.join(paths.moduleDir,`${paths.baseName}${ext}`);
+        try{
+          if(fsSync.existsSync(finalPath))throw new RunnerError('Arquivo final apareceu durante o download nativo.',{code:'DUPLICATE_OUTPUT_FILES'});
+          await fs.rename(stagedPath,finalPath);
+        }catch(error){return{attempted:true,ok:false,failureCode:error?.code||'NATIVE_PROMOTE_FAILED',diagnosticTail:diagnosticTail(error?.message||error),error};}
+        const stagedKey=methodKey(stagedPath);this.validationCacheByPath.delete(stagedKey);this.downloadMethodByPath.delete(stagedKey);
+        const finalKey=methodKey(finalPath);this.downloadMethodByPath.set(finalKey,'XCURSOS_NATIVE');
+        const finalValidation={...validation,downloadMethod:'XCURSOS_NATIVE'};this.validationCacheByPath.set(finalKey,{fingerprint:validation.fileFingerprint,validation:finalValidation});
+        success=true;
+        await this.logger?.log('NATIVE_DOWNLOAD','Completed and validated',{output:finalPath,duration:validation.duration,size:validation.size,mode:completionMode,guid:guid||null});
+        return{attempted:true,ok:true,finalPath,downloadMethod:'XCURSOS_NATIVE',validation:finalValidation,nativeTransport:completionMode};
+      }finally{
+        if(!success){try{await download?.cancel?.();}catch{}if(tracker?.guid&&cdp)await cdp.send('Browser.cancelDownload',{guid:tracker.guid}).catch(()=>{});}
+        tracker?.dispose?.();
+        if(behaviorSet&&cdp)await cdp.send('Browser.setDownloadBehavior',{behavior:'default'}).catch(async error=>{await this.logger?.log('NATIVE_DOWNLOAD','Failed to restore browser download behavior',{failureCode:'NATIVE_CDP_RESTORE_FAILED',diagnosticTail:diagnosticTail(error?.message||error)});});
+        try{await cdp?.detach?.();}catch{}
+        await cleanupStaging(stagingRoot).catch(async error=>{await this.logger?.log('NATIVE_DOWNLOAD','Staging cleanup failed',{failureCode:error?.code||'NATIVE_STAGING_CLEANUP_FAILED',diagnosticTail:diagnosticTail(error?.message||error)});});
+        await releaseBrowserLock();
+      }
+    });
   }
 
   async download({ mediaUrl, refererUrl, paths, signal=null, onProgress=null, cleanStart=false }) {
