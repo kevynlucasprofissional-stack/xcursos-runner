@@ -17,15 +17,17 @@ class NativeOnlyFakeDownloader extends DiskFakeDownloader{
     await fs.writeFile(finalPath,'VIDEO-NATIVE');
     return{ok:true,finalPath,downloadMethod:'XCURSOS_NATIVE'};
   }
+  async validateVideo(filePath){return{...(await super.validateVideo(filePath)),downloadMethod:'XCURSOS_NATIVE'};}
 }
 
-test('runner processes a trusted native-download-only lesson without waiting for video.src',async()=>{
+test('runner processes a trusted native-download-only lesson without waiting for video.src and persists the method',async()=>{
   const root=await tmp();
   const nativeOnly={...lesson(1,1,{video:false,title:'Native only'}),nativeDownloadUrl:'https://www.xcursos.com/api/video/download?lessonId=lesson-1',nativeDownloadAvailable:true,mediaSourceConfidence:'UNTRUSTED'};
   const browser=new FakeBrowser([nativeOnly]);const downloader=new NativeOnlyFakeDownloader();
   const runner=new XCursosCourseRunner({outputRoot:root,browser,downloader,limits:{mediaReadyTimeoutMs:0,downloadRetries:0}});
   const result=await runner.runCurrent({resume:true});
   assert.equal(result.status,'DOWNLOADED');assert.equal(downloader.calls.length,1);assert.equal(browser.stats.inspect>0,true);
+  assert.equal(runner.state.get(1)?.validation?.downloadMethod,'XCURSOS_NATIVE');
   await runner.dispose();
 });
 
