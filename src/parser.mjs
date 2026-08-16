@@ -171,7 +171,7 @@ export function parseXcursosLessonHtml(html, pageUrl = '') {
   const videoTags=value.match(/<video\b[^>]*>/gi)||[];
   const iframeUrls=(value.match(/<iframe\b[^>]*>/gi)||[]).map(x=>attr(x,'src')).filter(Boolean);
   const hasTrustedPlayerIframe=iframeUrls.some(isTrustedPlayerIframeUrl);
-  const hasUntrustedIframe=iframeUrls.some(x=>!isTrustedPlayerIframeUrl(x));
+  const hasUntrustedIframe=iframeUrls.some(x=>!isTrustedPlayerIframeUrl(x)&&!isAnalyticsIframeUrl(x));
   const hasNonAnalyticsIframe=iframeUrls.some(x=>!isAnalyticsIframeUrl(x));
   const result={
     site: 'xcursos',pageUrl,pageTitle,courseName: courseName || 'Curso XCursos',lessonTitle: lessonTitle || 'Aula',moduleName,modulePath:normalizeModulePath([],moduleName),
@@ -191,7 +191,7 @@ export function normalizeLiveLessonMeta(meta = {}, page = {}) {
   const media=direct||iframe;
   const current = Number(meta.currentPosition); const total = Number(meta.totalPositions);
   const hasTrustedPlayerIframe=Boolean(meta.hasTrustedPlayerIframe||(meta.iframeUrl&&isTrustedPlayerIframeUrl(meta.iframeUrl)));
-  const hasUntrustedIframe=Boolean(meta.hasUntrustedIframe||(meta.iframeUrl&&!isTrustedPlayerIframeUrl(meta.iframeUrl)));
+  const hasUntrustedIframe=Boolean(meta.hasUntrustedIframe||(meta.iframeUrl&&!isTrustedPlayerIframeUrl(meta.iframeUrl)&&!isAnalyticsIframeUrl(meta.iframeUrl)));
   const hasNonAnalyticsIframe=Boolean(meta.hasNonAnalyticsIframe||(meta.iframeUrl&&!isAnalyticsIframeUrl(meta.iframeUrl)));
   const modulePath=normalizeModulePath(meta.modulePath,meta.moduleName);
   const pageUrl=meta.pageUrl || page.url || '';
