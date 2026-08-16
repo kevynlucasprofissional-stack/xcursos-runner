@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseXcursosLessonHtml, isMaterialOnlyLesson } from '../src/parser.mjs';
+import { parseXcursosLessonHtml, normalizeLiveLessonMeta, isMaterialOnlyLesson } from '../src/parser.mjs';
 import { XCursosCourseRunner } from '../src/runner.mjs';
 
 const base='<h2>Curso Teste</h2><h1>Conteúdo</h1><span>1 / 5</span>';
@@ -14,10 +14,12 @@ function runnerForFastPath(){
   return{runner,get inspections(){return inspections;},get sleeps(){return sleeps;}};
 }
 
-test('material-only page is detected structurally even with an analytics iframe',()=>{
+test('material-only page is detected structurally even with an analytics iframe while preserving raw iframe diagnostics',()=>{
   const html=`${base}${material}<iframe src="https://www.googletagmanager.com/ns.html?id=GTM-X"></iframe>`;
   const lesson=parseXcursosLessonHtml(html,'https://www.xcursos.com/curso/c/aula/1');
-  assert.equal(lesson.hasMaterialsLinks,true);assert.equal(lesson.materialOnly,true);assert.equal(lesson.hasUntrustedIframe,false);assert.equal(lesson.hasNonAnalyticsIframe,false);assert.equal(isMaterialOnlyLesson(lesson),true);
+  assert.equal(lesson.hasMaterialsLinks,true);assert.equal(lesson.materialOnly,true);assert.equal(lesson.hasUntrustedIframe,true);assert.equal(lesson.hasNonAnalyticsIframe,false);assert.equal(isMaterialOnlyLesson(lesson),true);
+  const normalized=normalizeLiveLessonMeta(lesson,{url:lesson.pageUrl});
+  assert.equal(normalized.materialOnly,true);assert.equal(normalized.hasUntrustedIframe,false);
 });
 
 test('video-only page is never material-only',()=>{
@@ -45,10 +47,11 @@ test('materials plus native video download button is not material-only even befo
   assert.equal(lesson.nativeDownloadAvailable,true);assert.equal(lesson.materialOnly,false);
 });
 
-test('material-only metadata returns immediately from media readiness without polling or sleeping',async()=>{
-  const lesson=parseXcursosLessonHtml(`${base}${material}<iframe src="https://www.googletagmanager.com/ns.html?id=GTM-X"></iframe>`,'https://www.xcursos.com/curso/c/aula/1');
+test('normalized material-only metadata returns immediately from media readiness without polling or sleeping',async()=>{
+  const parsed=parseXcursosLessonHtml(`${base}${material}<iframe src="https://www.googletagmanager.com/ns.html?id=GTM-X"></iframe>`,'https://www.xcursos.com/curso/c/aula/1');
+  const lesson=normalizeLiveLessonMeta(parsed,{url:parsed.pageUrl});
   const state=runnerForFastPath();
-  assert.equal(state.runner.shouldWaitForMedia(lesson),false);
+  assert.equal(lesson.materialOnly,true);assert.equal(lesson.hasUntrustedIframe,false);assert.equal(state.runner.shouldWaitForMedia(lesson),false);
   const result=await state.runner.waitForProvenMedia(lesson,{position:1});
   assert.equal(result.materialOnly,true);assert.equal(state.inspections,0);assert.equal(state.sleeps,0);
 });
