@@ -33,12 +33,16 @@ class RecoverOnceBrowser extends FakeBrowser {
     this.closedInjected=false;
     this.recoveryAttempts=0;
     this.inspectPageIds=[];
+    this.position2Inspects=0;
   }
   async inspectLesson(page) {
     this.inspectPageIds.push(page?.id||null);
-    if (this.current === 2 && !this.closedInjected) {
-      this.closedInjected=true;
-      throw new BrowserAutomationError('A página Playwright não está mais disponível.', { code:'PAGE_CLOSED' });
+    if (this.current === 2 && !this.recovered) {
+      this.position2Inspects++;
+      if (this.position2Inspects >= 2 && !this.closedInjected) {
+        this.closedInjected=true;
+        throw new BrowserAutomationError('A página Playwright não está mais disponível.', { code:'PAGE_CLOSED' });
+      }
     }
     if (this.recovered && page?.id !== 'fresh-recovered-page') {
       throw new BrowserAutomationError('stale page reused after recovery', { code:'STALE_PAGE_REUSED' });
@@ -99,9 +103,9 @@ test('PAGE_CLOSED recovery replaces the stale PageRef and continues the same cou
     assert.equal(result.status,'RANGE_COMPLETE');
     assert.equal(browser.recoveryAttempts,1);
     assert.equal(runner.workPage.id,'fresh-recovered-page');
-    const postRecoveryIds=browser.inspectPageIds.slice(browser.inspectPageIds.indexOf('fresh-recovered-page'));
-    assert.ok(postRecoveryIds.length>0);
-    assert.ok(postRecoveryIds.every(id=>id==='fresh-recovered-page'),'the stale PageRef must never be reused after recovery');
+    const firstFresh=browser.inspectPageIds.indexOf('fresh-recovered-page');
+    assert.ok(firstFresh>=0);
+    assert.ok(browser.inspectPageIds.slice(firstFresh).every(id=>id==='fresh-recovered-page'),'the stale PageRef must never be reused after recovery');
 
     const manifest=await readJsonlFile(path.join(outputRoot,'Page Recovery Course','_xcursos-runner','manifest.jsonl'));
     assert.deepEqual(manifest.map(row=>row.position),[1,2,3]);
