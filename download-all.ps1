@@ -1,7 +1,8 @@
 param(
   [int]$MaxPasses = 12,
   [int]$DelaySeconds = 8,
-  [int]$NoProgressLimit = 3
+  [int]$NoProgressLimit = 3,
+  [switch]$Background
 )
 
 $ErrorActionPreference = 'Stop'
@@ -18,6 +19,28 @@ try { [Console]::OutputEncoding = $utf8 } catch {}
 
 $diagnosticBase = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'XCursosRunner\logs' } else { Join-Path $env:TEMP 'XCursosRunner\logs' }
 New-Item -ItemType Directory -Force -Path $diagnosticBase | Out-Null
+
+if ($Background -and $env:XCURSOS_BACKGROUND_WORKER -ne '1') {
+  $backgroundStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+  $stdoutPath = Join-Path $diagnosticBase "xcursos-all-background-$backgroundStamp-$PID.stdout.log"
+  $stderrPath = Join-Path $diagnosticBase "xcursos-all-background-$backgroundStamp-$PID.stderr.log"
+  $childArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -MaxPasses $MaxPasses -DelaySeconds $DelaySeconds -NoProgressLimit $NoProgressLimit"
+  $previousWorker = $env:XCURSOS_BACKGROUND_WORKER
+  $previousLaunchMode = $env:XCURSOS_LAUNCH_MODE
+  try {
+    $env:XCURSOS_BACKGROUND_WORKER = '1'
+    $env:XCURSOS_LAUNCH_MODE = 'background'
+    $process = Start-Process -FilePath 'powershell.exe' -ArgumentList $childArgs -WindowStyle Hidden -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -PassThru
+  } finally {
+    if ($null -eq $previousWorker) { Remove-Item Env:XCURSOS_BACKGROUND_WORKER -ErrorAction SilentlyContinue } else { $env:XCURSOS_BACKGROUND_WORKER = $previousWorker }
+    if ($null -eq $previousLaunchMode) { Remove-Item Env:XCURSOS_LAUNCH_MODE -ErrorAction SilentlyContinue } else { $env:XCURSOS_LAUNCH_MODE = $previousLaunchMode }
+  }
+  Write-Host "[XCursos ALL] Background iniciado. PID=$($process.Id)" -ForegroundColor Cyan
+  Write-Host "[XCursos ALL] stdout: $stdoutPath" -ForegroundColor Cyan
+  Write-Host "[XCursos ALL] stderr: $stderrPath" -ForegroundColor Cyan
+  exit 0
+}
+
 $transcriptStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $transcriptPath = Join-Path $diagnosticBase "xcursos-all-$transcriptStamp-$PID.log"
 $env:XCURSOS_POWERSHELL_TRANSCRIPT = $transcriptPath
