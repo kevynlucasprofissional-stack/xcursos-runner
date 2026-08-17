@@ -23,13 +23,18 @@ $appBase = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'XCursosRunner' 
 $diagnosticBase = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'XCursosRunner\logs' } else { Join-Path $env:TEMP 'XCursosRunner\logs' }
 $backgroundBase = Join-Path $appBase 'background'
 $backgroundControlPath = Join-Path $appBase 'background\xcursos-all.json'
+$configPath = Join-Path $appBase 'config.json'
 New-Item -ItemType Directory -Force -Path $diagnosticBase | Out-Null
 New-Item -ItemType Directory -Force -Path $backgroundBase | Out-Null
 
-function Read-BackgroundDescriptor {
-  if (-not (Test-Path -LiteralPath $backgroundControlPath)) { return $null }
-  try { return (Get-Content -Raw -LiteralPath $backgroundControlPath | ConvertFrom-Json) }
+function Read-JsonFileSafe([string]$Path) {
+  if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return $null }
+  try { return (Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json) }
   catch { return $null }
+}
+
+function Read-BackgroundDescriptor {
+  return Read-JsonFileSafe $backgroundControlPath
 }
 
 function Write-BackgroundDescriptor($descriptor) {
@@ -55,6 +60,44 @@ function Get-ValidatedBackgroundProcess($descriptor) {
   }
 }
 
+function Find-BackgroundDiagnostic($descriptor) {
+  if (-not $descriptor -or -not $descriptor.instanceId) { return $null }
+  $config = Read-JsonFileSafe $configPath
+  if (-not $config -or -not $config.outputRoot) { return $null }
+  $diagnosticsRoot = Join-Path ([string]$config.outputRoot) '_xcursos-diagnostics'
+  if (-not (Test-Path -LiteralPath $diagnosticsRoot)) { return $null }
+  $runs = @(Get-ChildItem -LiteralPath $diagnosticsRoot -Directory -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 100)
+  foreach ($run in $runs) {
+    $metaPath = Join-Path $run.FullName 'run-meta.json'
+    $meta = Read-JsonFileSafe $metaPath
+    if (-not $meta) { continue }
+    $backgroundSessionId = [string]$meta.context.backgroundSessionId
+    if ($backgroundSessionId -ne [string]$descriptor.instanceId) { continue }
+    $livenessPath = Join-Path $run.FullName 'liveness.json'
+    $reportJson = Join-Path $run.FullName 'diagnostic-report.json'
+    return [ordered]@{
+      runId = [string]$meta.runId
+      runDir = $run.FullName
+      reportJson = if (Test-Path -LiteralPath $reportJson) { $reportJson } else { $null }
+      livenessPath = if (Test-Path -LiteralPath $livenessPath) { $livenessPath } else { $null }
+      liveness = Read-JsonFileSafe $livenessPath
+    }
+  }
+  return $null
+}
+
+function Get-LastProgressLine($descriptor) {
+  if (-not $descriptor) { return $null }
+  foreach ($logPath in @([string]$descriptor.stderrPath, [string]$descriptor.stdoutPath)) {
+    if (-not $logPath -or -not (Test-Path -LiteralPath $logPath)) { continue }
+    try {
+      $matches = @(Get-Content -LiteralPath $logPath -Tail 200 -ErrorAction Stop | Where-Object { $_ -match '\[STATS\]|\[RETRY\]|\[DOWNLOAD|\[REPOSITION\]|Processing|Status=' })
+      if ($matches.Count -gt 0) { return [string]$matches[-1] }
+    } catch {}
+  }
+  return $null
+}
+
 function Get-BackgroundStatusObject {
   $descriptor = Read-BackgroundDescriptor
   if (-not $descriptor) {
@@ -62,6 +105,8 @@ function Get-BackgroundStatusObject {
   }
   $validatedProcess = Get-ValidatedBackgroundProcess $descriptor
   $active = $null -ne $validatedProcess
+  $diagnostic = Find-BackgroundDiagnostic $descriptor
+  $liveness = if ($diagnostic) { $diagnostic.liveness } else { $null }
   return [ordered]@{
     ok = $true
     status = if ($active) { 'BACKGROUND_RUNNING' } else { 'BACKGROUND_INACTIVE' }
@@ -75,6 +120,17 @@ function Get-BackgroundStatusObject {
     stderrPath = [string]$descriptor.stderrPath
     transcriptPath = [string]$descriptor.transcriptPath
     stopFile = [string]$descriptor.stopFile
+    currentRunId = if ($diagnostic) { [string]$diagnostic.runId } else { $null }
+    currentReportJson = if ($diagnostic) { [string]$diagnostic.reportJson } else { $null }
+    currentLivenessPath = if ($diagnostic) { [string]$diagnostic.livenessPath } else { $null }
+    livenessStatus = if ($liveness) { [string]$liveness.status } else { $null }
+    position = if ($liveness -and $null -ne $liveness.position) { [int]$liveness.position } else { $null }
+    stage = if ($liveness) { [string]$liveness.stage } else { $null }
+    operation = if ($liveness) { [string]$liveness.operation } else { $null }
+    lastProgressAt = if ($liveness) { [string]$liveness.lastProgressAt } else { $null }
+    msSinceProgress = if ($liveness -and $null -ne $liveness.msSinceProgress) { [long]$liveness.msSinceProgress } else { $null }
+    activeSubprocess = if ($liveness) { $liveness.activeSubprocess } else { $null }
+    lastProgressLine = Get-LastProgressLine $descriptor
     reason = if ($active) { $null } else { 'PID_STALE_EXITED_OR_REUSED' }
   }
 }
