@@ -22,57 +22,27 @@ test('late Browser.downloadWillBegin is absorbed before yt-dlp fallback so one l
   const root=await fs.mkdtemp(path.join(os.tmpdir(),'xc-native-late-start-'));
   const cdp=new LateCdp();let ytCalls=0;let nativeClicks=0;
   const lessonId='late-7';const guid='late-guid';
-  const locator={
-    async count(){return 1;},
-    async getAttribute(){return `/api/video/download?lessonId=${lessonId}`;},
-    async click(){
-      nativeClicks++;
-      setTimeout(async()=>{
-        try{
-          const url=`https://www.xcursos.com/api/video/download?lessonId=${lessonId}`;
-          cdp.emit('Browser.downloadWillBegin',{guid,url,suggestedFilename:'late.mp4'});
-          if(cdp.downloadPath){
-            await fs.mkdir(cdp.downloadPath,{recursive:true});
-            await fs.writeFile(path.join(cdp.downloadPath,guid),'late-native-video');
-          }
-          cdp.emit('Browser.downloadProgress',{guid,state:'completed',receivedBytes:17,totalBytes:17});
-        }catch{}
-      },35);
-    },
-  };
-  const page={
-    isClosed:()=>false,
-    locator:()=>({first:()=>locator}),
-    context:()=>({browser:()=>({async newBrowserCDPSession(){return cdp;}})}),
-    async waitForEvent(name,{timeout}={}){
-      assert.equal(name,'download');
-      return await new Promise((_,reject)=>setTimeout(()=>reject(new Error('Playwright download event timeout')),Math.min(20,timeout||20)));
-    },
-  };
+  const locator={async count(){return 1;},async getAttribute(){return `/api/video/download?lessonId=${lessonId}`;},async click(){nativeClicks++;setTimeout(async()=>{try{const url=`https://www.xcursos.com/api/video/download?lessonId=${lessonId}`;cdp.emit('Browser.downloadWillBegin',{guid,url,suggestedFilename:'late.mp4'});if(cdp.downloadPath){await fs.mkdir(cdp.downloadPath,{recursive:true});await fs.writeFile(path.join(cdp.downloadPath,guid),'late-native-video');}cdp.emit('Browser.downloadProgress',{guid,state:'completed',receivedBytes:17,totalBytes:17});}catch{}},35);}};
+  const page={isClosed:()=>false,locator:()=>({first:()=>locator}),context:()=>({browser:()=>({async newBrowserCDPSession(){return cdp;}})}),async waitForEvent(name,{timeout}={}){assert.equal(name,'download');return await new Promise((_,reject)=>setTimeout(()=>reject(new Error('Playwright download event timeout')),Math.min(20,timeout||20)));}};
   const finalViaYt=path.join(root,'007 - Late.mp4');
-  const downloader=new MediaDownloader({
-    ytDlpPath:'yt',ffprobePath:'ff',pageResolver:async()=>page,
-    limits:{nativeDownloadEventTimeoutMs:20,downloadTimeoutMs:1000,ffprobeTimeoutMs:200},
-    processRunner:async command=>{
-      if(command==='yt'){
-        ytCalls++;
-        await fs.writeFile(finalViaYt,'yt-video');
-        return{code:0,stdout:`${finalViaYt}\n`,stderr:''};
-      }
-      return goodFfprobe();
-    },
-  });
+  const downloader=new MediaDownloader({ytDlpPath:'yt',ffprobePath:'ff',pageResolver:async()=>page,limits:{nativeDownloadEventTimeoutMs:20,downloadTimeoutMs:1000,ffprobeTimeoutMs:200},processRunner:async command=>{if(command==='yt'){ytCalls++;await fs.writeFile(finalViaYt,'yt-video');return{code:0,stdout:`${finalViaYt}\n`,stderr:''};}return goodFfprobe();}});
   const paths={moduleDir:root,baseName:'007 - Late',template:path.join(root,'007 - Late.%(ext)s')};
   const result=await downloader.download({mediaUrl:'https://cdn.example/late.mp4',refererUrl:'https://www.xcursos.com/curso/c/aula/7',paths});
+  assert.equal(result.ok,true);assert.equal(result.downloadMethod,'XCURSOS_NATIVE','a bounded late-start grace must prefer the native transfer that was already triggered');assert.equal(result.nativeTransport,'CDP');assert.equal(nativeClicks,1);assert.equal(ytCalls,0,'yt-dlp must not start while the already-triggered native download is still entering CDP');assert.equal(await fs.readFile(result.finalPath,'utf8'),'late-native-video');
+  await new Promise(resolve=>setTimeout(resolve,70));await assert.rejects(fs.access(path.join(root,'.xcursos-download-staging')),{code:'ENOENT'});assert.deepEqual(cdp.commands.filter(x=>x.method==='Browser.setDownloadBehavior').map(x=>x.params.behavior),['allowAndName','default']);assert.equal(cdp.detached,true);
+});
 
-  assert.equal(result.ok,true);
-  assert.equal(result.downloadMethod,'XCURSOS_NATIVE','a bounded late-start grace must prefer the native transfer that was already triggered');
-  assert.equal(result.nativeTransport,'CDP');
-  assert.equal(nativeClicks,1);
-  assert.equal(ytCalls,0,'yt-dlp must not start while the already-triggered native download is still entering CDP');
-  assert.equal(await fs.readFile(result.finalPath,'utf8'),'late-native-video');
-  await new Promise(resolve=>setTimeout(resolve,70));
-  await assert.rejects(fs.access(path.join(root,'.xcursos-download-staging')),{code:'ENOENT'});
-  assert.deepEqual(cdp.commands.filter(x=>x.method==='Browser.setDownloadBehavior').map(x=>x.params.behavior),['allowAndName','default']);
-  assert.equal(cdp.detached,true);
+test('no late native start falls back once to safe yt-dlp and records the timeout stage without duplicate transfer',async()=>{
+  const root=await fs.mkdtemp(path.join(os.tmpdir(),'xc-native-no-late-'));
+  const cdp=new LateCdp();let ytCalls=0;let nativeClicks=0;const logs=[];
+  const locator={async count(){return 1;},async getAttribute(){return '/api/video/download?lessonId=no-late-7';},async click(){nativeClicks++;}};
+  const page={isClosed:()=>false,locator:()=>({first:()=>locator}),context:()=>({browser:()=>({async newBrowserCDPSession(){return cdp;}})}),async waitForEvent(name,{timeout}={}){assert.equal(name,'download');return await new Promise((_,reject)=>setTimeout(()=>reject(new Error('Playwright download event timeout')),Math.min(20,timeout||20)));}};
+  const finalViaYt=path.join(root,'008 - No Late.mp4');
+  const downloader=new MediaDownloader({ytDlpPath:'yt',ffprobePath:'ff',pageResolver:async()=>page,logger:{log:async(...args)=>logs.push(args)},limits:{nativeDownloadEventTimeoutMs:20,downloadTimeoutMs:1000,ffprobeTimeoutMs:200},processRunner:async command=>{if(command==='yt'){ytCalls++;await fs.writeFile(finalViaYt,'yt-video');return{code:0,stdout:`${finalViaYt}\n`,stderr:''};}return goodFfprobe();}});
+  const paths={moduleDir:root,baseName:'008 - No Late',template:path.join(root,'008 - No Late.%(ext)s')};
+  const result=await downloader.download({mediaUrl:'https://cdn.example/no-late.mp4',refererUrl:'https://www.xcursos.com/curso/c/aula/8',paths});
+  assert.equal(result.ok,true);assert.equal(result.downloadMethod,'YTDLP');assert.equal(result.nativeFailure.failureCode,'NATIVE_CDP_START_TIMEOUT');assert.equal(nativeClicks,1);assert.equal(ytCalls,1);
+  assert.ok(logs.some(([scope,message,data])=>scope==='NATIVE_DOWNLOAD'&&/late start/i.test(message)&&data?.stage==='WAIT_LATE_CDP_START'));
+  assert.ok(logs.some(([scope])=>scope==='NATIVE_FALLBACK'));
+  assert.deepEqual(cdp.commands.filter(x=>x.method==='Browser.setDownloadBehavior').map(x=>x.params.behavior),['allowAndName','default']);await assert.rejects(fs.access(path.join(root,'.xcursos-download-staging')),{code:'ENOENT'});
 });
