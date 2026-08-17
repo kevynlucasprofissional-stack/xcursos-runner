@@ -36,6 +36,10 @@ function transcriptRoot(env=process.env){
   if(env?.TEMP)return path.join(env.TEMP,'XCursosRunner','logs');
   return null;
 }
+function launchContext(env={},processRef=process){
+  const rawLauncher=Number(env?.XCURSOS_LAUNCHER_PID);const launcherPid=Number.isInteger(rawLauncher)&&rawLauncher>0?rawLauncher:null;
+  return{launchMode:env?.XCURSOS_LAUNCH_MODE==='background'?'background':'foreground',workerPid:processRef?.pid??process.pid,launcherPid};
+}
 
 export async function startCliDiagnostics({outputRoot,command,argv=[],processRef=process,env=process.env,sink=null,diagnosticsFactory=null,logger=null,exitFn=null,recoveryFn=recoverInterruptedDiagnosticRuns,retentionFn=enforceDiagnosticRetention,livenessFactory=null}={}){
   let recovery=null;
@@ -46,7 +50,7 @@ export async function startCliDiagnostics({outputRoot,command,argv=[],processRef
   const diagnostics=diagnosticsFactory?await diagnosticsFactory({outputRoot,command,argv,processRef,env,logger:sharedLogger}):new IntegratedRunDiagnostics({outputRoot,command,argv,processRef,env});
   const liveness=livenessFactory?await livenessFactory({diagnostics,processRef}):new DiagnosticLiveness({runId:diagnostics.runId,pid:processRef?.pid??process.pid});
   if(liveness){sharedLogger.configure?.({eventObserver:event=>liveness.noteEvent?.(event)});diagnostics.liveness=liveness;}
-  await diagnostics.start({logger:sharedLogger,context:{command}});
+  await diagnostics.start({logger:sharedLogger,context:{command,...launchContext(env,processRef)}});
   if(liveness&&diagnostics.runDir){const livenessPath=path.join(diagnostics.runDir,'liveness.json');liveness.configure?.({filePath:livenessPath,runId:diagnostics.runId,pid:processRef?.pid??process.pid});diagnostics.addArtifact?.('liveness',livenessPath,{description:'Heartbeat/liveness da execução'});liveness.start?.({filePath:livenessPath});await liveness.persist?.();}
   if(recovery?.recovered?.length)await diagnostics.phase('DIAGNOSTIC_RECOVERY','PASS',{recoveredRuns:recovery.recovered.map(x=>x.runId)});
   if(retention&&(retention.deletedRuns?.length||retention.deletedTranscripts?.length||retention.errors?.length)){
@@ -72,7 +76,7 @@ export async function finalizeCliDiagnostics({diagnostics,result=null,error=null
 
 export async function writeBootstrapFailureReport(error,{argv=[],processRef=process,env=process.env}={}){
   const diagnostics=new IntegratedRunDiagnostics({outputRoot:bootstrapRoot(env,processRef),command:'bootstrap',argv,processRef,env});
-  try{await diagnostics.start({logger:new RunnerLogger(),context:{phase:'CLI_BOOTSTRAP'}});await diagnostics.finalize({status:'BOOTSTRAP_ERROR',ok:false,error,exitCode:2,reason:'Failure before normal diagnostic lifecycle'});}
+  try{await diagnostics.start({logger:new RunnerLogger(),context:{phase:'CLI_BOOTSTRAP',...launchContext(env,processRef)}});await diagnostics.finalize({status:'BOOTSTRAP_ERROR',ok:false,error,exitCode:2,reason:'Failure before normal diagnostic lifecycle'});}
   catch(reportError){await diagnostics.emergency?.(reportError,'BOOTSTRAP_REPORT_FAILED');}
   return diagnostics.reference();
 }
