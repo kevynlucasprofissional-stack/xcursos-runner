@@ -56,7 +56,16 @@ jobs:
           Start-Process -FilePath $NodePath -ArgumentList $args -WindowStyle Hidden -RedirectStandardOutput $StdoutPath -RedirectStandardError $StderrPath | Out-Null
           '@ | Set-Content -LiteralPath $parentScript -Encoding ASCII
 
-          $parent = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $parentScript + '"'),('"' + $nodePath + '"'),('"' + $workerPath + '"'),('"' + $heartbeat + '"'),('"' + $stop + '"'),('"' + $pidFile + '"'),('"' + $stdout + '"'),('"' + $stderr + '"')) -PassThru -Wait
+          $parent = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $parentScript + '"'),('"' + $nodePath + '"'),('"' + $workerPath + '"'),('"' + $heartbeat + '"'),('"' + $stop + '"'),('"' + $pidFile + '"'),('"' + $stdout + '"'),('"' + $stderr + '"')) -PassThru
+          $parentDeadline = (Get-Date).AddSeconds(10)
+          while (-not $parent.HasExited -and (Get-Date) -lt $parentDeadline) {
+            Start-Sleep -Milliseconds 100
+            $parent.Refresh()
+          }
+          if (-not $parent.HasExited) {
+            Stop-Process -Id $parent.Id -Force -ErrorAction SilentlyContinue
+            throw 'Background launcher did not exit independently of its worker'
+          }
           if ($parent.ExitCode -ne 0) { throw "Background launcher failed with exit $($parent.ExitCode)" }
 
           $deadline = (Get-Date).AddSeconds(10)
