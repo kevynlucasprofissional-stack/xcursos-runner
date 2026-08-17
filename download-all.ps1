@@ -20,7 +20,7 @@ try { [Console]::InputEncoding = $utf8 } catch {}
 try { [Console]::OutputEncoding = $utf8 } catch {}
 
 $appBase = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'XCursosRunner' } else { Join-Path $env:TEMP 'XCursosRunner' }
-$diagnosticBase = Join-Path $appBase 'logs'
+$diagnosticBase = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'XCursosRunner\logs' } else { Join-Path $env:TEMP 'XCursosRunner\logs' }
 $backgroundBase = Join-Path $appBase 'background'
 $backgroundControlPath = Join-Path $appBase 'background\xcursos-all.json'
 New-Item -ItemType Directory -Force -Path $diagnosticBase | Out-Null
