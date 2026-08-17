@@ -37,7 +37,7 @@ export function formatRetryProgress({position,total,causeCode='UNKNOWN',detail=n
 }
 
 export class XCursosCourseRunner {
-  constructor({ profileDir=null, cdpEndpoint='http://127.0.0.1:9222', startUrl=null, headless=false, outputRoot=null, browser=null, browserSession=null, pageController=null, downloader=null, logger=null, limits={}, playwrightLoader=null, retryPolicy=null, schedulerFactory=null, sleepFn=sleep, runtimeStats=null, autoThrottle=null, shutdownController=null, progressSink=null, enableSignalHandlers=false, debugSnapshots=null }={}) {
+  constructor({ profileDir=null, cdpEndpoint='http://127.0.0.1:9222', startUrl=null, headless=false, outputRoot=null, browser=null, browserSession=null, pageController=null, downloader=null, logger=null, limits={}, playwrightLoader=null, retryPolicy=null, schedulerFactory=null, sleepFn=sleep, runtimeStats=null, autoThrottle=null, shutdownController=null, progressSink=null, enableSignalHandlers=false, debugSnapshots=null, stopRequestFile=process.env.XCURSOS_BACKGROUND_STOP_FILE||null }={}) {
     this.profileDir=profileDir; this.cdpEndpoint=cdpEndpoint; this.startUrl=startUrl; this.headless=headless;
     this.outputRoot=outputRoot || path.join(os.homedir(),'Downloads','Cursos');
     this.limits={...DEFAULT_LIMITS,...limits};
@@ -50,7 +50,7 @@ export class XCursosCourseRunner {
     this.retryPolicy=retryPolicy || new RetryPolicy({baseDelayMs:this.limits.retryBaseDelayMs,maxDelayMs:this.limits.retryMaxDelayMs,maxAttempts:Math.max(1,Number(this.limits.downloadRetries||0)+1),jitterRatio:this.limits.retryJitterRatio});
     this.schedulerFactory=schedulerFactory || (opts=>new LessonScheduler(opts));
     this.sleepFn=sleepFn;this.autoThrottle=autoThrottle||new AutoThrottle({minDelayMs:this.limits.throttleMinDelayMs,maxDelayMs:this.limits.throttleMaxDelayMs,sleepFn});
-    this.shutdown=shutdownController||new GracefulShutdownController();this.enableSignalHandlers=enableSignalHandlers;this.progressSink=progressSink;this.debugSnapshots=debugSnapshots||null;
+    this.shutdown=shutdownController||new GracefulShutdownController();this.enableSignalHandlers=enableSignalHandlers;this.progressSink=progressSink;this.debugSnapshots=debugSnapshots||null;this.stopRequestFile=stopRequestFile||null;
     this.scheduler=null;this.schedulerCheckpoint=null;this.navigationIndex=null;this.navigationPlanner=new NavigationPlanner();
     this.state=null; this.workPage=null; this.courseName=null; this.total=null; this.repairPositions=new Set();
   }
@@ -461,6 +461,21 @@ export class XCursosCourseRunner {
     }
   }
 
+  async checkExternalStopRequest(){
+    if(!this.stopRequestFile||this.shutdown.stopRequested)return false;
+    try{
+      const stat=await fs.stat(this.stopRequestFile);
+      if(!stat.isFile())return false;
+      await this.logger.log('SHUTDOWN','Background stop request observed',{source:'BACKGROUND_STOP_REQUEST'});
+      await this.shutdown.requestStop('BACKGROUND_STOP_REQUEST');
+      return true;
+    }catch(error){
+      if(error?.code==='ENOENT')return false;
+      await this.logger.log('SHUTDOWN','Background stop request could not be checked',{source:'BACKGROUND_STOP_REQUEST',failureCode:error?.code||'STOP_REQUEST_CHECK_FAILED'}).catch(()=>{});
+      return false;
+    }
+  }
+
   async runRange({start,end,resume=true,finalAudit=false}={}){
     await this.boot({resume,requireDownloader:true});
     const rawStart=start==null?1:Number(start); const rawEnd=end==null?this.total:Number(end);
@@ -483,6 +498,7 @@ export class XCursosCourseRunner {
 
     let previousPosition=null; const retryableFailureMap=new Map(); const blocked=[];let stopped=false;let firstTask=true;
     while(true){
+      await this.checkExternalStopRequest();
       if(this.shutdown.stopRequested){stopped=true;break;}
       const claimed=this.scheduler.claimNext();
       if(!claimed.task){
