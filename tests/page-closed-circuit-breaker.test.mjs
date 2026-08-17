@@ -49,9 +49,9 @@ test('persistent shared PAGE_CLOSED opens a global circuit instead of retrying m
     assert.deepEqual(manifest.map(row=>row.position),[1],'only the healthy committed prefix may remain durable');
 
     const checkpoint=JSON.parse(await fs.readFile(path.join(courseRoot,'scheduler.checkpoint.json'),'utf8'));
-    const unfinished=checkpoint.tasks.filter(task=>task.position>=2);
-    assert.ok(unfinished.length>=4,'all untouched positions must remain represented in checkpoint');
-    assert.ok(unfinished.every(task=>task.status!=='DONE'),'no failed or untouched position may be committed as DONE');
+    const unfinished=[...(checkpoint.ready||[]),...(checkpoint.retryLater||[]),...(checkpoint.inFlight||[]),...(checkpoint.blocked||[])]
+      .filter(task=>task.position>=2);
+    assert.equal(unfinished.length,4,'all untouched positions must remain represented in checkpoint');
   } finally {
     await runner.dispose();
   }
