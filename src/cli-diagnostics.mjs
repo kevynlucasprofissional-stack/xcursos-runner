@@ -38,7 +38,8 @@ function transcriptRoot(env=process.env){
 }
 function launchContext(env={},processRef=process){
   const rawLauncher=Number(env?.XCURSOS_LAUNCHER_PID);const launcherPid=Number.isInteger(rawLauncher)&&rawLauncher>0?rawLauncher:null;
-  return{launchMode:env?.XCURSOS_LAUNCH_MODE==='background'?'background':'foreground',workerPid:processRef?.pid??process.pid,launcherPid};
+  const backgroundSessionId=env?.XCURSOS_BACKGROUND_SESSION_ID?String(env.XCURSOS_BACKGROUND_SESSION_ID):null;
+  return{launchMode:env?.XCURSOS_LAUNCH_MODE==='background'?'background':'foreground',workerPid:processRef?.pid??process.pid,launcherPid,backgroundSessionId};
 }
 
 export async function startCliDiagnostics({outputRoot,command,argv=[],processRef=process,env=process.env,sink=null,diagnosticsFactory=null,logger=null,exitFn=null,recoveryFn=recoverInterruptedDiagnosticRuns,retentionFn=enforceDiagnosticRetention,livenessFactory=null}={}){
