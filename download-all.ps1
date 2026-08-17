@@ -1,7 +1,10 @@
 param(
   [int]$MaxPasses = 12,
   [int]$DelaySeconds = 8,
-  [int]$NoProgressLimit = 3
+  [int]$NoProgressLimit = 3,
+  [switch]$Background,
+  [switch]$Status,
+  [switch]$Stop
 )
 
 $ErrorActionPreference = 'Stop'
@@ -16,12 +19,204 @@ $OutputEncoding = $utf8
 try { [Console]::InputEncoding = $utf8 } catch {}
 try { [Console]::OutputEncoding = $utf8 } catch {}
 
+$appBase = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'XCursosRunner' } else { Join-Path $env:TEMP 'XCursosRunner' }
 $diagnosticBase = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'XCursosRunner\logs' } else { Join-Path $env:TEMP 'XCursosRunner\logs' }
+$backgroundBase = Join-Path $appBase 'background'
+$backgroundControlPath = Join-Path $appBase 'background\xcursos-all.json'
+$configPath = Join-Path $appBase 'config.json'
 New-Item -ItemType Directory -Force -Path $diagnosticBase | Out-Null
+New-Item -ItemType Directory -Force -Path $backgroundBase | Out-Null
+
+function Read-JsonFileSafe([string]$Path) {
+  if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return $null }
+  try { return (Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json) }
+  catch { return $null }
+}
+
+function Read-BackgroundDescriptor {
+  return Read-JsonFileSafe $backgroundControlPath
+}
+
+function Write-BackgroundDescriptor($descriptor) {
+  $tmp = "$backgroundControlPath.tmp-$PID"
+  $descriptor | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $tmp -Encoding UTF8
+  Move-Item -LiteralPath $tmp -Destination $backgroundControlPath -Force
+}
+
+function Get-ValidatedBackgroundProcess($descriptor) {
+  if (-not $descriptor -or -not $descriptor.pid) { return $null }
+  $candidatePid = [int]$descriptor.pid
+  if ($candidatePid -le 0) { return $null }
+  try {
+    $processInfo = Get-CimInstance Win32_Process -Filter "ProcessId = $candidatePid" -ErrorAction Stop
+    if (-not $processInfo) { return $null }
+    $commandLine = [string]$processInfo.CommandLine
+    $scriptPath = [string]$descriptor.scriptPath
+    if (-not $commandLine -or -not $scriptPath) { return $null }
+    if ($commandLine.IndexOf($scriptPath, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { return $null }
+    return $processInfo
+  } catch {
+    return $null
+  }
+}
+
+function Find-BackgroundDiagnostic($descriptor) {
+  if (-not $descriptor -or -not $descriptor.instanceId) { return $null }
+  $config = Read-JsonFileSafe $configPath
+  if (-not $config -or -not $config.outputRoot) { return $null }
+  $diagnosticsRoot = Join-Path ([string]$config.outputRoot) '_xcursos-diagnostics'
+  if (-not (Test-Path -LiteralPath $diagnosticsRoot)) { return $null }
+  $runs = @(Get-ChildItem -LiteralPath $diagnosticsRoot -Directory -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 100)
+  foreach ($run in $runs) {
+    $metaPath = Join-Path $run.FullName 'run-meta.json'
+    $meta = Read-JsonFileSafe $metaPath
+    if (-not $meta) { continue }
+    $backgroundSessionId = [string]$meta.context.backgroundSessionId
+    if ($backgroundSessionId -ne [string]$descriptor.instanceId) { continue }
+    $livenessPath = Join-Path $run.FullName 'liveness.json'
+    $reportJson = Join-Path $run.FullName 'diagnostic-report.json'
+    return [ordered]@{
+      runId = [string]$meta.runId
+      runDir = $run.FullName
+      reportJson = if (Test-Path -LiteralPath $reportJson) { $reportJson } else { $null }
+      livenessPath = if (Test-Path -LiteralPath $livenessPath) { $livenessPath } else { $null }
+      liveness = Read-JsonFileSafe $livenessPath
+    }
+  }
+  return $null
+}
+
+function Get-LastProgressLine($descriptor) {
+  if (-not $descriptor) { return $null }
+  foreach ($logPath in @([string]$descriptor.stderrPath, [string]$descriptor.stdoutPath)) {
+    if (-not $logPath -or -not (Test-Path -LiteralPath $logPath)) { continue }
+    try {
+      $matches = @(Get-Content -LiteralPath $logPath -Tail 200 -ErrorAction Stop | Where-Object { $_ -match '\[STATS\]|\[RETRY\]|\[DOWNLOAD|\[REPOSITION\]|Processing|Status=' })
+      if ($matches.Count -gt 0) { return [string]$matches[-1] }
+    } catch {}
+  }
+  return $null
+}
+
+function Get-BackgroundStatusObject {
+  $descriptor = Read-BackgroundDescriptor
+  if (-not $descriptor) {
+    return [ordered]@{ ok = $true; status = 'BACKGROUND_NOT_FOUND'; active = $false }
+  }
+  $validatedProcess = Get-ValidatedBackgroundProcess $descriptor
+  $active = $null -ne $validatedProcess
+  $diagnostic = Find-BackgroundDiagnostic $descriptor
+  $liveness = if ($diagnostic) { $diagnostic.liveness } else { $null }
+  return [ordered]@{
+    ok = $true
+    status = if ($active) { 'BACKGROUND_RUNNING' } else { 'BACKGROUND_INACTIVE' }
+    active = $active
+    instanceId = [string]$descriptor.instanceId
+    pid = [int]$descriptor.pid
+    startedAt = [string]$descriptor.startedAt
+    endedAt = [string]$descriptor.endedAt
+    workerStatus = [string]$descriptor.status
+    stdoutPath = [string]$descriptor.stdoutPath
+    stderrPath = [string]$descriptor.stderrPath
+    transcriptPath = [string]$descriptor.transcriptPath
+    stopFile = [string]$descriptor.stopFile
+    currentRunId = if ($diagnostic) { [string]$diagnostic.runId } else { $null }
+    currentReportJson = if ($diagnostic) { [string]$diagnostic.reportJson } else { $null }
+    currentLivenessPath = if ($diagnostic) { [string]$diagnostic.livenessPath } else { $null }
+    livenessStatus = if ($liveness) { [string]$liveness.status } else { $null }
+    position = if ($liveness -and $null -ne $liveness.position) { [int]$liveness.position } else { $null }
+    stage = if ($liveness) { [string]$liveness.stage } else { $null }
+    operation = if ($liveness) { [string]$liveness.operation } else { $null }
+    lastProgressAt = if ($liveness) { [string]$liveness.lastProgressAt } else { $null }
+    msSinceProgress = if ($liveness -and $null -ne $liveness.msSinceProgress) { [long]$liveness.msSinceProgress } else { $null }
+    activeSubprocess = if ($liveness) { $liveness.activeSubprocess } else { $null }
+    lastProgressLine = Get-LastProgressLine $descriptor
+    reason = if ($active) { $null } else { 'PID_STALE_EXITED_OR_REUSED' }
+  }
+}
+
+if ($Status) {
+  Get-BackgroundStatusObject | ConvertTo-Json -Depth 8
+  exit 0
+}
+
+if ($Stop) {
+  $descriptor = Read-BackgroundDescriptor
+  $validatedProcess = Get-ValidatedBackgroundProcess $descriptor
+  if (-not $descriptor -or -not $validatedProcess) {
+    [ordered]@{ ok = $true; status = 'BACKGROUND_NOT_RUNNING'; active = $false } | ConvertTo-Json -Depth 8
+    exit 0
+  }
+  $stopFile = [string]$descriptor.stopFile
+  if (-not $stopFile) { throw 'Background descriptor does not contain a stop request path.' }
+  [ordered]@{ instanceId = [string]$descriptor.instanceId; requestedAt = (Get-Date).ToUniversalTime().ToString('o'); reason = 'USER_REQUEST' } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $stopFile -Encoding UTF8
+  [ordered]@{ ok = $true; status = 'STOP_REQUESTED'; active = $true; instanceId = [string]$descriptor.instanceId; pid = [int]$descriptor.pid; stopFile = $stopFile } | ConvertTo-Json -Depth 8
+  exit 0
+}
+
+if ($Background -and $env:XCURSOS_BACKGROUND_WORKER -ne '1') {
+  $existing = Read-BackgroundDescriptor
+  if (Get-ValidatedBackgroundProcess $existing) {
+    [ordered]@{ ok = $false; status = 'BACKGROUND_ALREADY_RUNNING'; active = $true; instanceId = [string]$existing.instanceId; pid = [int]$existing.pid } | ConvertTo-Json -Depth 8
+    exit 2
+  }
+
+  $backgroundStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+  $instanceId = [guid]::NewGuid().ToString('N')
+  $stdoutPath = Join-Path $diagnosticBase "xcursos-all-background-$backgroundStamp-$instanceId.stdout.log"
+  $stderrPath = Join-Path $diagnosticBase "xcursos-all-background-$backgroundStamp-$instanceId.stderr.log"
+  $stopFile = Join-Path $backgroundBase "stop-$instanceId.request"
+  Remove-Item -LiteralPath $stopFile -Force -ErrorAction SilentlyContinue
+  $childArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -MaxPasses $MaxPasses -DelaySeconds $DelaySeconds -NoProgressLimit $NoProgressLimit"
+  $previousWorker = $env:XCURSOS_BACKGROUND_WORKER
+  $previousLaunchMode = $env:XCURSOS_LAUNCH_MODE
+  $previousSessionId = $env:XCURSOS_BACKGROUND_SESSION_ID
+  $previousStopFile = $env:XCURSOS_BACKGROUND_STOP_FILE
+  $previousLauncherPid = $env:XCURSOS_LAUNCHER_PID
+  try {
+    $env:XCURSOS_BACKGROUND_WORKER = '1'
+    $env:XCURSOS_LAUNCH_MODE = 'background'
+    $env:XCURSOS_BACKGROUND_SESSION_ID = $instanceId
+    $env:XCURSOS_BACKGROUND_STOP_FILE = $stopFile
+    $env:XCURSOS_LAUNCHER_PID = [string]$PID
+    $process = Start-Process -FilePath 'powershell.exe' -ArgumentList $childArgs -WindowStyle Hidden -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -PassThru
+  } finally {
+    if ($null -eq $previousWorker) { Remove-Item Env:XCURSOS_BACKGROUND_WORKER -ErrorAction SilentlyContinue } else { $env:XCURSOS_BACKGROUND_WORKER = $previousWorker }
+    if ($null -eq $previousLaunchMode) { Remove-Item Env:XCURSOS_LAUNCH_MODE -ErrorAction SilentlyContinue } else { $env:XCURSOS_LAUNCH_MODE = $previousLaunchMode }
+    if ($null -eq $previousSessionId) { Remove-Item Env:XCURSOS_BACKGROUND_SESSION_ID -ErrorAction SilentlyContinue } else { $env:XCURSOS_BACKGROUND_SESSION_ID = $previousSessionId }
+    if ($null -eq $previousStopFile) { Remove-Item Env:XCURSOS_BACKGROUND_STOP_FILE -ErrorAction SilentlyContinue } else { $env:XCURSOS_BACKGROUND_STOP_FILE = $previousStopFile }
+    if ($null -eq $previousLauncherPid) { Remove-Item Env:XCURSOS_LAUNCHER_PID -ErrorAction SilentlyContinue } else { $env:XCURSOS_LAUNCHER_PID = $previousLauncherPid }
+  }
+  $descriptor = [ordered]@{
+    schemaVersion = 1
+    instanceId = $instanceId
+    pid = $process.Id
+    startedAt = (Get-Date).ToUniversalTime().ToString('o')
+    endedAt = $null
+    status = 'RUNNING'
+    launchMode = 'background'
+    scriptPath = $PSCommandPath
+    stdoutPath = $stdoutPath
+    stderrPath = $stderrPath
+    transcriptPath = $null
+    stopFile = $stopFile
+  }
+  Write-BackgroundDescriptor $descriptor
+  [ordered]@{ ok = $true; status = 'BACKGROUND_STARTED'; active = $true; instanceId = $instanceId; pid = $process.Id; startedAt = $descriptor.startedAt; stdoutPath = $stdoutPath; stderrPath = $stderrPath; stopFile = $stopFile; statusCommand = 'xcursos-all -Status'; stopCommand = 'xcursos-all -Stop' } | ConvertTo-Json -Depth 8
+  exit 0
+}
+
 $transcriptStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $transcriptPath = Join-Path $diagnosticBase "xcursos-all-$transcriptStamp-$PID.log"
 $env:XCURSOS_POWERSHELL_TRANSCRIPT = $transcriptPath
 $transcriptStarted = $false
+if ($env:XCURSOS_BACKGROUND_WORKER -eq '1' -and $env:XCURSOS_BACKGROUND_SESSION_ID) {
+  $workerDescriptor = Read-BackgroundDescriptor
+  if ($workerDescriptor -and [string]$workerDescriptor.instanceId -eq [string]$env:XCURSOS_BACKGROUND_SESSION_ID) {
+    $workerDescriptor.transcriptPath = $transcriptPath
+    Write-BackgroundDescriptor $workerDescriptor
+  }
+}
 try {
   Start-Transcript -Path $transcriptPath -Force | Out-Null
   $transcriptStarted = $true
@@ -137,5 +332,15 @@ try {
 } finally {
   if ($transcriptStarted) {
     try { Stop-Transcript | Out-Null } catch {}
+  }
+  if ($env:XCURSOS_BACKGROUND_WORKER -eq '1' -and $env:XCURSOS_BACKGROUND_SESSION_ID) {
+    try {
+      $finalDescriptor = Read-BackgroundDescriptor
+      if ($finalDescriptor -and [string]$finalDescriptor.instanceId -eq [string]$env:XCURSOS_BACKGROUND_SESSION_ID) {
+        $finalDescriptor.status = 'EXITED'
+        $finalDescriptor.endedAt = (Get-Date).ToUniversalTime().ToString('o')
+        Write-BackgroundDescriptor $finalDescriptor
+      }
+    } catch {}
   }
 }

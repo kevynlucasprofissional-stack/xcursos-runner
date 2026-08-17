@@ -37,7 +37,7 @@ export function formatRetryProgress({position,total,causeCode='UNKNOWN',detail=n
 }
 
 export class XCursosCourseRunner {
-  constructor({ profileDir=null, cdpEndpoint='http://127.0.0.1:9222', startUrl=null, headless=false, outputRoot=null, browser=null, browserSession=null, pageController=null, downloader=null, logger=null, limits={}, playwrightLoader=null, retryPolicy=null, schedulerFactory=null, sleepFn=sleep, runtimeStats=null, autoThrottle=null, shutdownController=null, progressSink=null, enableSignalHandlers=false, debugSnapshots=null }={}) {
+  constructor({ profileDir=null, cdpEndpoint='http://127.0.0.1:9222', startUrl=null, headless=false, outputRoot=null, browser=null, browserSession=null, pageController=null, downloader=null, logger=null, limits={}, playwrightLoader=null, retryPolicy=null, schedulerFactory=null, sleepFn=sleep, runtimeStats=null, autoThrottle=null, shutdownController=null, progressSink=null, enableSignalHandlers=false, debugSnapshots=null, stopRequestFile=process.env.XCURSOS_BACKGROUND_STOP_FILE||null }={}) {
     this.profileDir=profileDir; this.cdpEndpoint=cdpEndpoint; this.startUrl=startUrl; this.headless=headless;
     this.outputRoot=outputRoot || path.join(os.homedir(),'Downloads','Cursos');
     this.limits={...DEFAULT_LIMITS,...limits};
@@ -50,7 +50,7 @@ export class XCursosCourseRunner {
     this.retryPolicy=retryPolicy || new RetryPolicy({baseDelayMs:this.limits.retryBaseDelayMs,maxDelayMs:this.limits.retryMaxDelayMs,maxAttempts:Math.max(1,Number(this.limits.downloadRetries||0)+1),jitterRatio:this.limits.retryJitterRatio});
     this.schedulerFactory=schedulerFactory || (opts=>new LessonScheduler(opts));
     this.sleepFn=sleepFn;this.autoThrottle=autoThrottle||new AutoThrottle({minDelayMs:this.limits.throttleMinDelayMs,maxDelayMs:this.limits.throttleMaxDelayMs,sleepFn});
-    this.shutdown=shutdownController||new GracefulShutdownController();this.enableSignalHandlers=enableSignalHandlers;this.progressSink=progressSink;this.debugSnapshots=debugSnapshots||null;
+    this.shutdown=shutdownController||new GracefulShutdownController();this.enableSignalHandlers=enableSignalHandlers;this.progressSink=progressSink;this.debugSnapshots=debugSnapshots||null;this.stopRequestFile=stopRequestFile||null;
     this.scheduler=null;this.schedulerCheckpoint=null;this.navigationIndex=null;this.navigationPlanner=new NavigationPlanner();
     this.state=null; this.workPage=null; this.courseName=null; this.total=null; this.repairPositions=new Set();
   }
@@ -436,6 +436,46 @@ export class XCursosCourseRunner {
     throw lastError;
   }
 
+  async recoverSharedBrowserInfrastructure({position,lessonUrl=null,cause=null}={}){
+    const targetUrl=lessonUrl||this.state?.get(position)?.lessonUrl||this.state?.state?.workPageUrl||null;
+    await this.logger.log('RECOVERY','Shared browser/page unavailable; attempting bounded recovery',{position,causeCode:cause?.code||null});
+    try{
+      const recovered=await this.browser.recoverWorkingPage({workPageUrl:targetUrl,forceReconnect:true});
+      if(!recovered)throw new RunnerError('Browser/page recovery returned no working page.',{code:'PAGE_RECOVERY_FAILED'});
+      this.workPage=recovered;
+      let observed=await this.browser.inspectLesson(this.workPage);
+      this.assertRepositionIdentity(observed,{expectedPosition:position,strategy:'SHARED_BROWSER_RECOVERY'});
+      if(Number(observed.currentPosition)!==Number(position) && targetUrl && typeof this.browser.navigateExact==='function'){
+        this.workPage=await this.browser.navigateExact(this.workPage,targetUrl);
+        observed=await this.browser.inspectLesson(this.workPage);
+        this.assertRepositionIdentity(observed,{expectedPosition:position,strategy:'SHARED_BROWSER_RECOVERY_EXACT'});
+      }
+      if(Number(observed.currentPosition)!==Number(position))throw new RunnerError(`Recuperação observou ${observed.currentPosition}, esperada ${position}.`,{code:'POSITION_MISMATCH',details:{position,observed:observed.currentPosition,context:'SHARED_BROWSER_RECOVERY'}});
+      await this.state.setWorkPage(observed.pageUrl||this.workPage.url);
+      await this.rememberNavigation(observed);
+      await this.logger.log('RECOVERY','Shared browser/page recovery validated',{position,recoveredPageId:this.workPage?.id||null});
+      return observed;
+    }catch(recoveryError){
+      await this.logger.log('RECOVERY','Shared browser/page recovery exhausted',{position,originalCode:cause?.code||null,recoveryCode:recoveryError?.code||null});
+      throw new RunnerError('Não foi possível recuperar a infraestrutura compartilhada do navegador.',{code:'BROWSER_RECOVERY_EXHAUSTED',cause:recoveryError,details:{position,originalCode:cause?.code||null,recoveryCode:recoveryError?.code||null}});
+    }
+  }
+
+  async checkExternalStopRequest(){
+    if(!this.stopRequestFile||this.shutdown.stopRequested)return false;
+    try{
+      const stat=await fs.stat(this.stopRequestFile);
+      if(!stat.isFile())return false;
+      await this.logger.log('SHUTDOWN','Background stop request observed',{source:'BACKGROUND_STOP_REQUEST'});
+      await this.shutdown.requestStop('BACKGROUND_STOP_REQUEST');
+      return true;
+    }catch(error){
+      if(error?.code==='ENOENT')return false;
+      await this.logger.log('SHUTDOWN','Background stop request could not be checked',{source:'BACKGROUND_STOP_REQUEST',failureCode:error?.code||'STOP_REQUEST_CHECK_FAILED'}).catch(()=>{});
+      return false;
+    }
+  }
+
   async runRange({start,end,resume=true,finalAudit=false}={}){
     await this.boot({resume,requireDownloader:true});
     const rawStart=start==null?1:Number(start); const rawEnd=end==null?this.total:Number(end);
@@ -458,6 +498,7 @@ export class XCursosCourseRunner {
 
     let previousPosition=null; const retryableFailureMap=new Map(); const blocked=[];let stopped=false;let firstTask=true;
     while(true){
+      await this.checkExternalStopRequest();
       if(this.shutdown.stopRequested){stopped=true;break;}
       const claimed=this.scheduler.claimNext();
       if(!claimed.task){
@@ -503,19 +544,34 @@ export class XCursosCourseRunner {
         if(this.shutdown.forceRequested||error?.code==='PROCESS_ABORTED'){const lessonUrl=this.state.state?.workPageUrl||task.lessonUrl||null;try{this.scheduler.release(position,{lessonUrl,lastError:{code:'FORCE_STOP'}});}catch{}await this.schedulerCheckpoint.save(this.scheduler.snapshot());stopped=true;break;}
         await this.debugSnapshots?.capture?.({position,pageRef:this.workPage,error,metadata:{courseName:this.courseName,total:this.total,scheduler:this.scheduler.statusCounts()},networkEvents:this.browser.networkSnapshot?.(this.workPage)||[]});
         const lessonUrl=this.state.state?.workPageUrl||task.lessonUrl||null;
-        const decision=this.retryPolicy.decide({attempt:task.attempts,error});
-        if(decision.retry){
-          this.runtimeStats.recordFailure();this.runtimeStats.recordRetry();this.autoThrottle.recordFailure({status:error?.status||null});
-          this.scheduler.requeue(position,{delayMs:decision.delayMs,priorityPenalty:decision.priorityPenalty,lastError:safeError(error),lessonUrl});
-          const networkCode=error?.details?.networkCode||null;
-          await this.state.appendError({scope:'SCHED',position,status:'RETRY_LATER',message:String(error?.message||error),code:error?.code||null,networkCode,attempt:decision.attempt,maxAttempts:decision.maxAttempts,delayMs:decision.delayMs});
-          await this.reportRetry({position,decision,code:error?.code||null,networkCode,message:error?.message||null});
-          previousPosition=null;
+        if(isTargetClosedError(error)){
+          try{
+            await this.recoverSharedBrowserInfrastructure({position,lessonUrl,cause:error});
+            this.runtimeStats.recordFailure();this.runtimeStats.recordRetry();
+            this.scheduler.requeue(position,{delayMs:0,priorityPenalty:0,lastError:{code:'PAGE_RECOVERED',original:safeError(error)},lessonUrl});
+            await this.state.appendError({scope:'SCHED',position,status:'RECOVERED',message:'Infraestrutura compartilhada do navegador recuperada; posição será repetida.',code:error?.code||'PAGE_CLOSED'});
+            previousPosition=null;
+          }catch(recoveryError){
+            try{this.scheduler.release(position,{lessonUrl,lastError:safeError(recoveryError)});}catch{}
+            await this.schedulerCheckpoint.save(this.scheduler.snapshot());
+            await this.state.appendError({scope:'SCHED',position,status:'BROWSER_RECOVERY_EXHAUSTED',message:String(recoveryError?.message||recoveryError),code:recoveryError?.code||'BROWSER_RECOVERY_EXHAUSTED',originalCode:error?.code||null});
+            throw recoveryError;
+          }
         }else{
-          this.scheduler.markBlocked(position,{lastError:safeError(error),lessonUrl});
-          await this.schedulerCheckpoint.save(this.scheduler.snapshot());
-          await this.state.appendError({scope:'SCHED',position,status:'BLOCKED',message:String(error?.message||error),code:error?.code||null,networkCode:error?.details?.networkCode||null,attempt:decision.attempt,maxAttempts:decision.maxAttempts});
-          throw error;
+          const decision=this.retryPolicy.decide({attempt:task.attempts,error});
+          if(decision.retry){
+            this.runtimeStats.recordFailure();this.runtimeStats.recordRetry();this.autoThrottle.recordFailure({status:error?.status||null});
+            this.scheduler.requeue(position,{delayMs:decision.delayMs,priorityPenalty:decision.priorityPenalty,lastError:safeError(error),lessonUrl});
+            const networkCode=error?.details?.networkCode||null;
+            await this.state.appendError({scope:'SCHED',position,status:'RETRY_LATER',message:String(error?.message||error),code:error?.code||null,networkCode,attempt:decision.attempt,maxAttempts:decision.maxAttempts,delayMs:decision.delayMs});
+            await this.reportRetry({position,decision,code:error?.code||null,networkCode,message:error?.message||null});
+            previousPosition=null;
+          }else{
+            this.scheduler.markBlocked(position,{lastError:safeError(error),lessonUrl});
+            await this.schedulerCheckpoint.save(this.scheduler.snapshot());
+            await this.state.appendError({scope:'SCHED',position,status:'BLOCKED',message:String(error?.message||error),code:error?.code||null,networkCode:error?.details?.networkCode||null,attempt:decision.attempt,maxAttempts:decision.maxAttempts});
+            throw error;
+          }
         }
       }
       await this.schedulerCheckpoint.save(this.scheduler.snapshot());

@@ -109,10 +109,11 @@ async function cleanupStaging(stagingRoot){
   try{await fs.rm(stagingRoot,{recursive:true,force:true});}catch(error){throw new RunnerError('Não foi possível limpar o staging de download nativo.',{code:'NATIVE_STAGING_CLEANUP_FAILED',cause:error,details:{stagingRoot}});}
 }
 function createCdpDownloadTracker(cdp,expectedUrl,{startTimeoutMs,completionTimeoutMs,signal=null}={}){
-  let guid=null,suggestedFilename='',startTimer=null,completionTimer=null,settledStart=false,settledCompletion=false;
-  let startResolve,startReject,completionResolve,completionReject;
+  let guid=null,suggestedFilename='',startTimer=null,completionTimer=null,settledStart=false,settledCompletion=false,latestStart=null;
+  let startResolve,startReject,completionResolve,completionReject,lateStartResolve;
   const started=new Promise((resolve,reject)=>{startResolve=resolve;startReject=reject;});
   const completed=new Promise((resolve,reject)=>{completionResolve=resolve;completionReject=reject;});
+  const lateStarted=new Promise(resolve=>{lateStartResolve=resolve;});
   started.catch(()=>{});completed.catch(()=>{});
   const cleanupTimers=()=>{if(startTimer)clearTimeout(startTimer);if(completionTimer)clearTimeout(completionTimer);};
   const rejectStart=error=>{if(settledStart)return;settledStart=true;startReject(error);};
@@ -121,7 +122,10 @@ function createCdpDownloadTracker(cdp,expectedUrl,{startTimeoutMs,completionTime
     if(guid||!isExpectedNativeUrl(event?.url||'',expectedUrl))return;
     guid=String(event.guid||'');suggestedFilename=String(event.suggestedFilename||'');
     if(!guid)return;
-    if(startTimer)clearTimeout(startTimer);settledStart=true;startResolve({guid,suggestedFilename,url:event.url||null});
+    latestStart={guid,suggestedFilename,url:event.url||null};
+    lateStartResolve(latestStart);
+    if(startTimer)clearTimeout(startTimer);
+    if(!settledStart){settledStart=true;startResolve(latestStart);}
     completionTimer=setTimeout(()=>rejectCompletion(new RunnerError('Download nativo excedeu o tempo limite.',{code:'NATIVE_DOWNLOAD_TIMEOUT',details:{guid}})),Math.max(1,Number(completionTimeoutMs)||1));
   };
   const onProgress=event=>{
@@ -140,7 +144,15 @@ function createCdpDownloadTracker(cdp,expectedUrl,{startTimeoutMs,completionTime
   cdp.on?.('Browser.downloadWillBegin',onWillBegin);cdp.on?.('Browser.downloadProgress',onProgress);
   startTimer=setTimeout(()=>rejectStart(new RunnerError('Chrome não emitiu Browser.downloadWillBegin para a aula atual.',{code:'NATIVE_CDP_START_TIMEOUT'})),Math.max(1,Number(startTimeoutMs)||1));
   signal?.addEventListener?.('abort',onAbort,{once:true});
-  return{started,completed,get guid(){return guid;},dispose(){cleanupTimers();signal?.removeEventListener?.('abort',onAbort);cdp.off?.('Browser.downloadWillBegin',onWillBegin);cdp.off?.('Browser.downloadProgress',onProgress);}};
+  return{
+    started,completed,
+    get guid(){return guid;},
+    async waitForLateStart(ms){
+      if(latestStart)return latestStart;
+      return await withTimeout(lateStarted,ms,new RunnerError('Chrome não iniciou o download nativo dentro da janela curta de assentamento.',{code:'NATIVE_CDP_LATE_START_NOT_OBSERVED'}),signal);
+    },
+    dispose(){cleanupTimers();signal?.removeEventListener?.('abort',onAbort);cdp.off?.('Browser.downloadWillBegin',onWillBegin);cdp.off?.('Browser.downloadProgress',onProgress);}
+  };
 }
 
 export class MediaDownloader {
@@ -300,13 +312,37 @@ export class MediaDownloader {
             }
           }else{
             const result=await playwrightDownloadPromise;
-            if(!result.ok)return{attempted:true,ok:false,failureCode:startError?.code||'NATIVE_DOWNLOAD_EVENT_FAILED',diagnosticTail:diagnosticTail(startError?.message||result.error?.message||result.error),error:startError||result.error};
-            download=result.value;
-            let browserFailure=null;try{browserFailure=await download.failure();}catch(error){browserFailure=String(error?.message||error);}
-            if(browserFailure)return{attempted:true,ok:false,failureCode:'NATIVE_DOWNLOAD_FAILED',diagnosticTail:diagnosticTail(browserFailure)};
-            suggestedFilename=download.suggestedFilename?.()||'';
-            try{sourcePath=await withTimeout(download.path(),this.limits.downloadTimeoutMs,new RunnerError('Playwright não retornou o caminho do download a tempo.',{code:'NATIVE_DOWNLOAD_TIMEOUT'}),signal);}catch(error){return{attempted:true,ok:false,failureCode:error?.code||startError?.code||'NATIVE_PATH_UNAVAILABLE',diagnosticTail:diagnosticTail(error?.message||error),error};}
-            completionMode='PLAYWRIGHT_PATH';
+            if(!result.ok){
+              if(startError?.code==='NATIVE_CDP_START_TIMEOUT'){
+                const graceMs=Math.min(1000,Math.max(100,Number(this.limits.nativeDownloadEventTimeoutMs)||100));
+                await this.logger?.log('NATIVE_DOWNLOAD','Initial CDP start deadline elapsed; waiting briefly for a late start before fallback',{failureCode:'NATIVE_CDP_START_TIMEOUT',stage:'WAIT_LATE_CDP_START',graceMs});
+                let lateStarted=null;
+                try{lateStarted=await tracker.waitForLateStart(graceMs);}catch{}
+                if(lateStarted){
+                  guid=lateStarted.guid;suggestedFilename=lateStarted.suggestedFilename||'';
+                  await this.logger?.log('NATIVE_DOWNLOAD','Late CDP start observed; continuing the already-triggered native transfer',{stage:'CDP_LATE_START',guid});
+                  try{
+                    const event=await tracker.completed;
+                    const file=path.join(attemptDir,event.guid);await waitForFile(file,{timeoutMs:5000,signal});
+                    sourcePath=file;guid=event.guid;suggestedFilename=event.suggestedFilename||lateStarted.suggestedFilename||'';completionMode='CDP';
+                  }catch(error){
+                    if(tracker.guid&&cdp)await cdp.send('Browser.cancelDownload',{guid:tracker.guid}).catch(()=>{});
+                    return{attempted:true,ok:false,failureCode:error?.code||'NATIVE_DOWNLOAD_FAILED',diagnosticTail:diagnosticTail(error?.message||error),error};
+                  }
+                }else{
+                  return{attempted:true,ok:false,failureCode:startError?.code||'NATIVE_DOWNLOAD_EVENT_FAILED',diagnosticTail:diagnosticTail(startError?.message||result.error?.message||result.error),error:startError||result.error};
+                }
+              }else{
+                return{attempted:true,ok:false,failureCode:startError?.code||'NATIVE_DOWNLOAD_EVENT_FAILED',diagnosticTail:diagnosticTail(startError?.message||result.error?.message||result.error),error:startError||result.error};
+              }
+            }else{
+              download=result.value;
+              let browserFailure=null;try{browserFailure=await download.failure();}catch(error){browserFailure=String(error?.message||error);}
+              if(browserFailure)return{attempted:true,ok:false,failureCode:'NATIVE_DOWNLOAD_FAILED',diagnosticTail:diagnosticTail(browserFailure)};
+              suggestedFilename=download.suggestedFilename?.()||'';
+              try{sourcePath=await withTimeout(download.path(),this.limits.downloadTimeoutMs,new RunnerError('Playwright não retornou o caminho do download a tempo.',{code:'NATIVE_DOWNLOAD_TIMEOUT'}),signal);}catch(error){return{attempted:true,ok:false,failureCode:error?.code||startError?.code||'NATIVE_PATH_UNAVAILABLE',diagnosticTail:diagnosticTail(error?.message||error),error};}
+              completionMode='PLAYWRIGHT_PATH';
+            }
           }
         }else{
           const result=await playwrightDownloadPromise;

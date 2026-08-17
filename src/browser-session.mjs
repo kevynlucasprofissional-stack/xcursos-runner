@@ -5,7 +5,10 @@ import { assertLocalCdpEndpoint } from './chrome-launcher.mjs';
 const ACTIVE_CONTEXTS=new Set();
 function contextClosed(context){try{return context?.isClosed?.()===true;}catch{return false;}}
 function browserConnected(browser){try{return browser?.isConnected?.()!==false;}catch{return false;}}
-export function isTargetClosedError(error){return /(?:Target page, context or browser has been closed|target.*closed|page.*closed|browser.*closed|browser has been disconnected|connection closed|session closed)/i.test(String(error?.message||error||''));}
+export function isTargetClosedError(error){
+  if(String(error?.code||'')==='PAGE_CLOSED')return true;
+  return /(?:Target page, context or browser has been closed|target.*closed|page.*closed|browser.*closed|browser has been disconnected|connection closed|session closed)/i.test(String(error?.message||error||''));
+}
 
 export async function findConnectedPageByUrl(url=''){
   const target=String(url||'');if(!target)return null;
