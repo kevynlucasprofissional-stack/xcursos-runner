@@ -31,6 +31,56 @@ jobs:
       - name: Test suite
         run: npm test
 
+      - name: Windows background independence smoke
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          if ($PSVersionTable.PSVersion.Major -ne 5) {
+            throw "Expected Windows PowerShell 5.1, got $($PSVersionTable.PSVersion)"
+          }
+
+          $root = Join-Path $env:RUNNER_TEMP 'xcursos-background-independence'
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          $heartbeat = Join-Path $root 'heartbeat.json'
+          $stop = Join-Path $root 'stop.request'
+          $pidFile = Join-Path $root 'worker.pid'
+          $stdout = Join-Path $root 'worker.stdout.log'
+          $stderr = Join-Path $root 'worker.stderr.log'
+          $parentScript = Join-Path $root 'launcher.ps1'
+          $nodePath = (Get-Command node).Source
+          $workerPath = (Resolve-Path '.\tests\fixtures\background-heartbeat-worker.mjs').Path
+
+          @'
+          param($NodePath, $WorkerPath, $HeartbeatPath, $StopPath, $PidPath, $StdoutPath, $StderrPath)
+          $args = @('"' + $WorkerPath + '"', '"' + $HeartbeatPath + '"', '"' + $StopPath + '"', '"' + $PidPath + '"')
+          Start-Process -FilePath $NodePath -ArgumentList $args -WindowStyle Hidden -RedirectStandardOutput $StdoutPath -RedirectStandardError $StderrPath | Out-Null
+          '@ | Set-Content -LiteralPath $parentScript -Encoding ASCII
+
+          $parent = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $parentScript + '"'),('"' + $nodePath + '"'),('"' + $workerPath + '"'),('"' + $heartbeat + '"'),('"' + $stop + '"'),('"' + $pidFile + '"'),('"' + $stdout + '"'),('"' + $stderr + '"')) -PassThru -Wait
+          if ($parent.ExitCode -ne 0) { throw "Background launcher failed with exit $($parent.ExitCode)" }
+
+          $deadline = (Get-Date).AddSeconds(10)
+          while (-not (Test-Path -LiteralPath $pidFile) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 100 }
+          if (-not (Test-Path -LiteralPath $pidFile)) { throw 'Worker PID file was not created after launcher exit' }
+          $workerPid = [int](Get-Content -Raw -LiteralPath $pidFile).Trim()
+          if (-not (Get-Process -Id $workerPid -ErrorAction SilentlyContinue)) { throw 'Worker is not alive after launcher exit' }
+
+          while (-not (Test-Path -LiteralPath $heartbeat) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 100 }
+          if (-not (Test-Path -LiteralPath $heartbeat)) { throw 'Initial heartbeat was not created' }
+          $first = Get-Content -Raw -LiteralPath $heartbeat | ConvertFrom-Json
+          Start-Sleep -Milliseconds 900
+          $second = Get-Content -Raw -LiteralPath $heartbeat | ConvertFrom-Json
+          if ([int]$second.counter -le [int]$first.counter) { throw 'Heartbeat did not advance after launcher exit' }
+          if ([int]$second.pid -ne $workerPid) { throw 'Heartbeat PID does not match worker PID' }
+
+          New-Item -ItemType File -Force -Path $stop | Out-Null
+          $exitDeadline = (Get-Date).AddSeconds(5)
+          while ((Get-Process -Id $workerPid -ErrorAction SilentlyContinue) -and (Get-Date) -lt $exitDeadline) { Start-Sleep -Milliseconds 100 }
+          if (Get-Process -Id $workerPid -ErrorAction SilentlyContinue) {
+            Stop-Process -Id $workerPid -Force
+            throw 'Worker did not stop after stop request'
+          }
+
       - name: Windows diagnostics and PowerShell 5.1 smoke
         if: runner.os == 'Windows'
         shell: powershell
